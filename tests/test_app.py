@@ -114,6 +114,78 @@ async def test_navigation_switches_views() -> None:
 
 
 @pytest.mark.asyncio
+async def test_journal_navigation_wraps_around() -> None:
+    app = DevNullApp()
+    async with app.run_test():
+        app._move_journal(-1)
+        assert app.active_log == "trending"
+        app._move_journal(1)
+        assert app.active_log == "latest"
+        app._show_log("following")
+        app._move_journal(1)
+        assert app.active_log == "trending"
+        app._move_journal(1)
+        assert app.active_log == "latest"
+
+
+@pytest.mark.asyncio
+async def test_cached_journals_refresh_only_after_selection_settles() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str | None]] = []
+
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            self.calls.append((log_name, cursor))
+            count = sum(name == log_name for name, _ in self.calls)
+            commit = ApiCommit(
+                f"{log_name}-{count}",
+                "octocat",
+                "The Octocat",
+                f"{log_name} version {count}",
+                "2026-10-20T18:00:00Z",
+                0,
+                0,
+            )
+            return ApiLog((commit,), None, False, 0, ())
+
+    app = DevNullApp()
+    client = FakeClient()
+    app.api_client = client
+
+    async with app.run_test() as pilot:
+        async def wait_for_load(log_name: str, request_count: int) -> None:
+            for _ in range(40):
+                if (
+                    sum(name == log_name for name, _ in client.calls) >= request_count
+                    and not app.log_loading[log_name]
+                ):
+                    return
+                await pilot.pause(0.05)
+            pytest.fail(f"{log_name} did not finish loading")
+
+        app._show_log("latest")
+        await wait_for_load("latest", 1)
+        app._show_log("following")
+        await wait_for_load("following", 1)
+
+        app._show_log("latest")
+        assert app.query_one("#latest-list").children[0].commit.id == "latest-1"
+        await pilot.pause(1.1)
+        assert sum(name == "latest" for name, _ in client.calls) == 1
+
+        app._show_log("following")
+        assert app.query_one("#following-list").children[0].commit.id == "following-1"
+        await pilot.pause(1.1)
+        assert sum(name == "latest" for name, _ in client.calls) == 1
+        assert sum(name == "following" for name, _ in client.calls) == 1
+
+        await pilot.pause(1.1)
+        await wait_for_load("following", 2)
+        assert sum(name == "latest" for name, _ in client.calls) == 1
+        assert app.query_one("#following-list").children[0].commit.id == "following-2"
+
+
+@pytest.mark.asyncio
 async def test_notifications_view_loads_pages_and_opens_commit() -> None:
     notification_commit = ApiCommit(
         "notification-commit",
@@ -266,17 +338,19 @@ async def test_notifications_view_loads_pages_and_opens_commit() -> None:
         assert isinstance(app.screen, CommitDetailScreen)
         assert app.screen.current_level.commit == notification_commit
         thread_text = app.screen.query_one("#thread-context", LinkedText).content
+        current_commit = app.screen.query_one("#current-commit", LinkedText).content
         assert isinstance(thread_text, Text)
+        assert isinstance(current_commit, Text)
         assert "Oldest ancestor." in thread_text.plain
         assert "Middle ancestor." in thread_text.plain
         assert "Nearest ancestor." in thread_text.plain
-        assert "A commit from your notifications." in thread_text.plain
+        assert "A commit from your notifications." in current_commit.plain
         assert "↓" not in thread_text.plain
         await pilot.press("u")
         await pilot.pause(0.1)
         assert isinstance(app.screen, CommitDetailScreen)
         assert app.screen.current_level.commit.id == "nearest-id"
-        await pilot.press("escape")
+        await pilot.press("q")
         await pilot.pause()
         assert not isinstance(app.screen, CommitDetailScreen)
 
@@ -548,6 +622,7 @@ async def test_user_can_submit_commits_and_replies() -> None:
 @pytest.mark.asyncio
 async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
     original_body = "Full original commit. " + ("additional context " * 50)
+    ancestor_body = "Ancestor context. " + ("previous comment " * 30)
     parent = ApiCommit(
         "parent-id",
         "octocat",
@@ -587,7 +662,19 @@ async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
             return ApiLog((parent,), None, False, 0, ())
 
         def get_commit_detail(self, commit_id):
-            return ApiCommitDetail(parent, ())
+            return ApiCommitDetail(
+                parent,
+                (
+                    ApiCommitContext(
+                        "ancestor-id",
+                        "root",
+                        "Root",
+                        ancestor_body,
+                        "2026-10-20T17:00:00Z",
+                        1,
+                    ),
+                ),
+            )
 
         def get_replies(self, commit_id, cursor=None) -> ApiLog:
             self.reply_cursors.append((commit_id, cursor))
@@ -614,9 +701,16 @@ async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
         history = app.screen.query_one("#thread-history-pane")
         thread_context = app.screen.query_one("#thread-context", LinkedText).content
         assert isinstance(thread_context, Text)
-        assert original_body.strip() in thread_context.plain
+        current_commit = app.screen.query_one("#current-commit", LinkedText).content
+        assert isinstance(current_commit, Text)
+        assert original_body.strip() in current_commit.plain
+        assert ancestor_body.strip() in thread_context.plain
         assert history.max_scroll_y > 0
         replies = app.screen.query_one("#commit-replies")
+        assert history.region.x < replies.region.x
+        assert history.region.right <= replies.region.x
+        current_pane = app.screen.query_one("#current-commit-pane")
+        assert current_pane.region.y < replies.region.y
         assert len(app.screen.current_level.replies) == 12
         assert len(replies.children) == 12
         assert client.reply_cursors == [("parent-id", None)]
@@ -645,8 +739,11 @@ async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
         assert len(app.screen.levels) == 2
         assert client.reply_cursors[-1] == ("reply-0", None)
         thread_context = app.screen.query_one("#thread-context", LinkedText).content
+        current_commit = app.screen.query_one("#current-commit", LinkedText).content
         assert isinstance(thread_context, Text)
-        assert thread_context.plain.index(original_body.strip()) < thread_context.plain.index("Reply 0")
+        assert isinstance(current_commit, Text)
+        assert original_body.strip() in thread_context.plain
+        assert "Reply 0" in current_commit.plain
 
         await pilot.press("u")
         await pilot.pause()

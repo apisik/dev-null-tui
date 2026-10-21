@@ -238,6 +238,7 @@ class CommitDetailScreen(ModalScreen[None]):
         Binding("ctrl+k", "scroll_history_up", show=False, priority=True),
         Binding("ctrl+r", "reply_to_current", "Reply", show=False, priority=True),
         Binding("u", "parent_comment", "Parent comment", show=False, priority=True),
+        Binding("q", "back", "Back", show=False, priority=True),
         Binding("escape", "back", "Back", show=False, priority=True),
         Binding("r", "retry_replies", "Retry replies", show=False, priority=True),
     ]
@@ -252,13 +253,21 @@ class CommitDetailScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Container(id="commit-detail-dialog"):
             yield Label("COMMIT THREAD", id="commit-detail-title")
-            with VerticalScroll(id="thread-history-pane"):
-                yield LinkedText(self._thread_display(), id="thread-context")
-            yield Label("", id="replies-title")
-            yield Static("Loading replies...", id="replies-status")
-            yield RepliesListView(id="commit-replies")
+            with Horizontal(id="thread-columns"):
+                with VerticalScroll(id="thread-history-pane"):
+                    yield LinkedText(self._thread_display(), id="thread-context")
+                with Vertical(id="thread-replies-pane"):
+                    yield Label("REPLYING TO", id="current-commit-title")
+                    with VerticalScroll(id="current-commit-pane"):
+                        yield LinkedText(
+                            self._current_commit_display(),
+                            id="current-commit",
+                        )
+                    yield Label("", id="replies-title")
+                    yield Static("Loading replies...", id="replies-status")
+                    yield RepliesListView(id="commit-replies")
             yield Static(
-                "Ctrl+j/k scroll ancestors · j/k select reply · Enter follow · Ctrl+R reply · u parent · Esc back · r retry",
+                "Ctrl+j/k scroll ancestors · j/k select reply · Enter follow · Ctrl+R reply · u parent · q/Esc back · r retry",
                 id="detail-help",
             )
 
@@ -279,8 +288,10 @@ class CommitDetailScreen(ModalScreen[None]):
         rendered = Text()
         chain: list[ApiCommit | ApiCommitContext] = [
             *self.ancestor_context,
-            *(level.commit for level in self.levels),
+            *(level.commit for level in self.levels[:-1]),
         ]
+        if not chain:
+            return Text("No earlier context.", style="dim")
         for index, commit in enumerate(chain):
             if index:
                 rendered.append("\n\n")
@@ -296,6 +307,14 @@ class CommitDetailScreen(ModalScreen[None]):
                     )
                 )
         return rendered
+
+    def _current_commit_display(self) -> Text:
+        commit = self.current_level.commit
+        return _commit_display(
+            commit,
+            max(len(commit.body), 1),
+            show_counts=True,
+        )
 
     def _scroll_history(self, direction: int) -> None:
         history = self.query_one("#thread-history-pane", VerticalScroll)
@@ -330,6 +349,9 @@ class CommitDetailScreen(ModalScreen[None]):
     def _show_current_level(self) -> None:
         level = self.current_level
         self.query_one("#thread-context", LinkedText).update(self._thread_display())
+        self.query_one("#current-commit", LinkedText).update(
+            self._current_commit_display()
+        )
         self.query_one("#replies-title", Label).update(
             f"REPLIES / @{level.commit.username} · {level.commit.replies_count}"
         )
@@ -672,6 +694,11 @@ class DevNullApp(App[None]):
             "latest": None,
             "trending": None,
         }
+        self.log_loaded: dict[LogName, bool] = {
+            "following": False,
+            "latest": False,
+            "trending": False,
+        }
         self.log_versions: dict[LogName, int] = {
             "following": 0,
             "latest": 0,
@@ -856,7 +883,23 @@ class DevNullApp(App[None]):
             "trending": "LOG / TRENDING",
         }
         self._show_view(f"{log_name}-view", titles[log_name], f"{log_name}-log")
-        self._start_log_load(log_name, reset=True)
+        if self.log_loaded[log_name]:
+            self.run_worker(
+                self._refresh_log_after_idle(log_name),
+                group="log-auto-refresh",
+                exclusive=True,
+            )
+        else:
+            self._start_log_load(log_name, reset=True)
+
+    async def _refresh_log_after_idle(self, log_name: LogName) -> None:
+        await asyncio.sleep(2)
+        if (
+            self.is_running
+            and self.active_log == log_name
+            and self.query_one("#views", ContentSwitcher).current == f"{log_name}-view"
+        ):
+            self._start_log_load(log_name, reset=True)
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
@@ -1050,6 +1093,7 @@ class DevNullApp(App[None]):
                 )
                 self.query_one(f"#{log_name}-status", Static).display = False
                 self.log_cursors[log_name] = None
+                self.log_loaded[log_name] = False
                 self.log_versions[log_name] += 1
                 self.log_loading[log_name] = False
             self._show_view("profile", "PROFILE / GUEST", "profile")
@@ -1065,9 +1109,8 @@ class DevNullApp(App[None]):
             return
         journals: tuple[LogName, ...] = ("latest", "following", "trending")
         current = journals.index(self.active_log)
-        target = current + direction
-        if 0 <= target < len(journals):
-            self._show_log(journals[target])
+        target = (current + direction) % len(journals)
+        self._show_log(journals[target])
 
     def _move_commit_selection(self, direction: int) -> None:
         current_view = self.query_one("#views", ContentSwitcher).current
@@ -1210,14 +1253,12 @@ class DevNullApp(App[None]):
             return
         if not reset and self.log_cursors[log_name] is None:
             return
-        if reset:
-            self.log_cursors[log_name] = None
-            self.query_one(f"#{log_name}-list", ListView).clear()
+        cursor = None if reset else self.log_cursors[log_name]
         self.log_versions[log_name] += 1
         version = self.log_versions[log_name]
         self.log_loading[log_name] = True
         self.run_worker(
-            self._load_log_page(log_name, self.log_cursors[log_name], reset, version),
+            self._load_log_page(log_name, cursor, reset, version),
             group=f"log-{log_name}",
             exclusive=True,
         )
@@ -1253,6 +1294,7 @@ class DevNullApp(App[None]):
             cards = [CommitCard(commit) for commit in log.commits]
             commit_list.extend(cards)
             self.log_cursors[log_name] = log.next_cursor
+            self.log_loaded[log_name] = True
             if not cards and log.suggestions:
                 names = ", ".join(f"@{user.username}" for user in log.suggestions)
                 status.display = True

@@ -17,11 +17,12 @@ and submits through the signed `POST /api/v1/commits` endpoint. Press
 `Ctrl+P` to submit. Press `Ctrl+Q` or `Escape` to close the composer.
 Press `Enter` on a selected journal entry to open its full commit and replies.
 Use `j` / `k` to navigate replies, `Enter` to follow a reply into its own
-thread, `u` to move to the parent comment, and `Escape` to return to the
-previous screen. Commit details show the full ancestor chain in a fixed-height
-scrollable pane above the replies. Press `Ctrl+J` / `Ctrl+K` or use the mouse
-wheel to scroll the ancestor history. Press `Ctrl+R` to reply to the thread's
-main commit or selected comment. Scroll the replies list to load older replies.
+thread, `u` to move to the parent comment, and `q` or `Escape` to return to the
+previous screen. Commit details show the ancestor and parent-comment context
+in a scrollable pane on the left, and the comment being replied to above its
+replies on the right. Press `Ctrl+J` / `Ctrl+K` or use the mouse wheel to
+scroll the ancestor history. Press `Ctrl+R` to reply to the thread's main
+commit or selected comment. Scroll the replies list to load older replies.
 
 The profile's **Sign in with GitHub** action starts the documented PKCE
 device authorization flow. To preserve existing sign-ins, the app keeps its
@@ -74,12 +75,17 @@ Keyboard shortcuts:
 - `Ctrl+J` / `Ctrl+K` — Scroll commit thread history
 - `Ctrl+R` — Reply to the thread's main commit or selected comment
 - `u` — Move up to the parent comment in a thread
+- `q` (commit thread) — Return to the previous screen
 - `Escape` — Return to the previous screen
 - `Shift+C` — New commit
 - `Shift+Q` — Quote selected commit
 - `Shift+R` — Reply to selected commit
 - `Ctrl+P` — Submit the commit, reply, or quote
 - `q` — Quit
+
+Journal navigation wraps between Latest, Following, and Trending. Loaded
+journals remain visible when you switch away; a cached journal refreshes after
+you leave it selected for two seconds.
 
 ## Test
 
