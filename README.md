@@ -102,8 +102,8 @@ version in `pyproject.toml` (and refresh `uv.lock`), then push a matching
 version tag, for example:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The workflow checks that the tag matches the project version, runs the tests,
