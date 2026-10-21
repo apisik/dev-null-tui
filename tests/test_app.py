@@ -5,14 +5,31 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from rich.style import Style
+from rich.text import Text
+from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.events import MouseScrollDown
 from textual.widgets import ContentSwitcher, Label, Static, TextArea
 
-from dev_null_tty import CommitComposerScreen, DevNullApp
+from dev_null_tty import (
+    CommitDetailScreen,
+    CommitComposerScreen,
+    DevNullApp,
+    LinkedText,
+    LinkedText,
+    NotificationDetailScreen,
+    _commit_display,
+    _linkify_urls,
+)
 from dev_null_tty.api import (
     ApiError,
     ApiCommit,
+    ApiCommitContext,
+    ApiCommitDetail,
     ApiLog,
+    ApiNotification,
+    ApiNotifications,
     ApiUser,
     DeviceAuthorization,
     SignedApiClient,
@@ -45,6 +62,15 @@ async def test_app_starts_on_latest_log() -> None:
         assert not app.query("#new-commit")
         assert not app.query("#reply-selected")
         assert not app.query("#quote-selected")
+
+
+@pytest.mark.asyncio
+async def test_ctrl_p_opens_command_palette_outside_composer() -> None:
+    app = DevNullApp()
+
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+p")
+        assert app.screen.id == "--command-palette"
 
 
 @pytest.mark.asyncio
@@ -81,8 +107,178 @@ async def test_navigation_switches_views() -> None:
         assert app.query_one("#views", ContentSwitcher).current == "following-view"
         app.action_show_trending()
         assert app.query_one("#views", ContentSwitcher).current == "trending-view"
+        app.action_show_notifications()
+        assert app.query_one("#views", ContentSwitcher).current == "notifications-view"
         app.action_show_profile()
         assert app.query_one("#views", ContentSwitcher).current == "profile"
+
+
+@pytest.mark.asyncio
+async def test_notifications_view_loads_pages_and_opens_commit() -> None:
+    notification_commit = ApiCommit(
+        "notification-commit",
+        "octocat",
+        "The Octocat",
+        "A commit from your notifications.",
+        "2026-10-20T18:00:00Z",
+        1,
+        0,
+    )
+    notification = ApiNotification(
+        "notification-id",
+        "starred",
+        "2026-10-20T18:00:00Z",
+        ApiUser("octocat", "The Octocat", None, None),
+        1,
+        1,
+        1,
+        None,
+        notification_commit,
+    )
+    follow_notification = ApiNotification(
+        "follow-notification-id",
+        "followed",
+        "2026-10-20T18:00:00Z",
+        ApiUser("octocat", "The Octocat", None, None),
+        1,
+        1,
+        0,
+        None,
+        None,
+    )
+
+    class FakeClient:
+        cursors = []
+
+        def get_commit_detail(self, commit_id):
+            if commit_id == "nearest-id":
+                return ApiCommitDetail(
+                    ApiCommit(
+                        "nearest-id",
+                        "nearest",
+                        "Nearest",
+                        "Nearest ancestor.",
+                        "2026-10-20T17:30:00Z",
+                        0,
+                        1,
+                    ),
+                    (
+                        ApiCommitContext(
+                            "oldest-id",
+                            "root",
+                            "Root",
+                            "Oldest ancestor.",
+                            "2026-10-20T16:00:00Z",
+                            2,
+                        ),
+                        ApiCommitContext(
+                            "middle-id",
+                            "middle",
+                            "Middle",
+                            "Middle ancestor.",
+                            "2026-10-20T17:00:00Z",
+                            1,
+                        ),
+                    ),
+                )
+            return ApiCommitDetail(
+                notification_commit,
+                (
+                    ApiCommitContext(
+                        "oldest-id",
+                        "root",
+                        "Root",
+                        "Oldest ancestor.",
+                        "2026-10-20T16:00:00Z",
+                        2,
+                    ),
+                    ApiCommitContext(
+                        "middle-id",
+                        "middle",
+                        "Middle",
+                        "Middle ancestor.",
+                        "2026-10-20T17:00:00Z",
+                        1,
+                    ),
+                    ApiCommitContext(
+                        "nearest-id",
+                        "nearest",
+                        "Nearest",
+                        "Nearest ancestor.",
+                        "2026-10-20T17:30:00Z",
+                        1,
+                    ),
+                ),
+            )
+
+        def get_notifications(self, cursor=None):
+            self.cursors.append(cursor)
+            if cursor is None:
+                return ApiNotifications(
+                    (notification, follow_notification),
+                    "older",
+                    "2026-10-20T18:00:00Z",
+                )
+            return ApiNotifications((), None, "2026-10-20T18:00:00Z")
+
+        def get_replies(self, commit_id, cursor=None) -> ApiLog:
+            return ApiLog((), None, False, 0, ())
+
+    app = DevNullApp()
+    client = FakeClient()
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._set_authenticated_user(
+            client,
+            ApiUser("reader", "Reader", None, None),
+        )
+        app.action_show_notifications()
+        for _ in range(20):
+            if len(client.cursors) == 2 and not app.notifications_loading:
+                break
+            await pilot.pause(0.05)
+
+        notification_list = app.query_one("#notifications-list")
+        assert client.cursors == [None, "older"]
+        assert not app.query_one("#search").display
+        assert len(notification_list.children) == 2
+        rendered_notification = notification_list.children[0].query_one(LinkedText).content
+        assert isinstance(rendered_notification, Text)
+        assert "starred your commit" in rendered_notification.plain
+
+        await pilot.press("j", "j")
+        assert notification_list.index == 1
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, NotificationDetailScreen)
+        assert "followed you" in app.screen.query_one(
+            "#notification-detail-content",
+            LinkedText,
+        ).content.plain
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, NotificationDetailScreen)
+        await pilot.press("k")
+        assert notification_list.index == 0
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, CommitDetailScreen)
+        assert app.screen.current_level.commit == notification_commit
+        thread_text = app.screen.query_one("#thread-context", LinkedText).content
+        assert isinstance(thread_text, Text)
+        assert "Oldest ancestor." in thread_text.plain
+        assert "Middle ancestor." in thread_text.plain
+        assert "Nearest ancestor." in thread_text.plain
+        assert "A commit from your notifications." in thread_text.plain
+        assert "↓" not in thread_text.plain
+        await pilot.press("u")
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, CommitDetailScreen)
+        assert app.screen.current_level.commit.id == "nearest-id"
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, CommitDetailScreen)
 
 
 @pytest.mark.asyncio
@@ -144,7 +340,13 @@ async def test_short_journal_auto_loads_until_it_fills_viewport() -> None:
 
     async with app.run_test(size=(120, 50)) as pilot:
         app._show_log("latest")
-        await pilot.pause(0.1)
+        for _ in range(20):
+            if (
+                len(app.query("#latest-list CommitCard")) == 2
+                and not app.log_loading["latest"]
+            ):
+                break
+            await pilot.pause(0.05)
 
         assert app.api_client.cursors == [None, "page-2"]
         assert len(app.query("#latest-list CommitCard")) == 2
@@ -293,9 +495,26 @@ async def test_user_can_submit_commits_and_replies() -> None:
         assert "Original post" in str(
             app.screen.query_one("#composer-context", Static).render()
         )
-        app.screen.query_one("#commit-body", TextArea).text = "A thoughtful reply."
-        await app._submit_commit()
+        post_button = app.screen.query_one("#submit-commit")
+        text_area = app.screen.query_one("#commit-body", TextArea)
+        assert post_button.disabled
+        text_area.text = " \n "
+        await pilot.pause()
+        assert post_button.disabled
+        await pilot.press("ctrl+p")
+        await pilot.pause()
+        assert client.submissions == []
+        assert isinstance(app.screen, CommitComposerScreen)
+        assert "cannot be empty" in str(
+            app.screen.query_one("#composer-status", Static).render()
+        )
+        text_area.text = "A thoughtful reply."
+        await pilot.pause()
+        assert not post_button.disabled
+        await pilot.press("ctrl+p")
+        await pilot.pause()
         assert client.submissions[0] == ("A thoughtful reply.", "parent-id", None)
+        assert not isinstance(app.screen, CommitComposerScreen)
 
         await pilot.pause()
         app.query_one("#latest-list").index = 0
@@ -311,15 +530,284 @@ async def test_user_can_submit_commits_and_replies() -> None:
         await pilot.press("Q")
         assert isinstance(app.screen, CommitComposerScreen)
         app.screen.query_one("#commit-body", TextArea).text = "A quote with my comment."
-        await app._submit_commit()
+        await pilot.press("ctrl+p")
+        await pilot.pause()
         assert client.submissions[1] == ("A quote with my comment.", None, "parent-id")
+        assert not isinstance(app.screen, CommitComposerScreen)
 
         app.query_one("#latest-list").focus()
         await pilot.press("C")
         assert isinstance(app.screen, CommitComposerScreen)
         app.screen.query_one("#commit-body", TextArea).text = "A new commit."
-        await app._submit_commit()
+        await pilot.press("ctrl+p")
+        await pilot.pause()
         assert client.submissions[2] == ("A new commit.", None, None)
+        assert not isinstance(app.screen, CommitComposerScreen)
+
+
+@pytest.mark.asyncio
+async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
+    original_body = "Full original commit. " + ("additional context " * 50)
+    parent = ApiCommit(
+        "parent-id",
+        "octocat",
+        "The Octocat",
+        original_body,
+        "2026-10-20T18:00:00Z",
+        0,
+        12,
+    )
+    first_page = tuple(
+        ApiCommit(
+            f"reply-{index}",
+            "octocat",
+            "The Octocat",
+            f"Reply {index}",
+            "2026-10-20T18:00:00Z",
+            0,
+            0,
+        )
+        for index in range(12)
+    )
+    older_reply = ApiCommit(
+        "older-reply",
+        "octocat",
+        "The Octocat",
+        "An older reply.",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.reply_cursors = []
+
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            return ApiLog((parent,), None, False, 0, ())
+
+        def get_commit_detail(self, commit_id):
+            return ApiCommitDetail(parent, ())
+
+        def get_replies(self, commit_id, cursor=None) -> ApiLog:
+            self.reply_cursors.append((commit_id, cursor))
+            if commit_id != "parent-id":
+                return ApiLog((), None, False, 0, ())
+            if cursor is None:
+                return ApiLog(first_page, "older", False, 0, ())
+            return ApiLog((older_reply,), None, False, 0, ())
+
+    app = DevNullApp()
+    client = FakeClient()
+    app.api_client = client
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        app._show_log("latest")
+        await pilot.pause(0.1)
+        journal = app.query_one("#latest-list")
+        journal.index = 0
+        journal.focus()
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+
+        assert isinstance(app.screen, CommitDetailScreen)
+        history = app.screen.query_one("#thread-history-pane")
+        thread_context = app.screen.query_one("#thread-context", LinkedText).content
+        assert isinstance(thread_context, Text)
+        assert original_body.strip() in thread_context.plain
+        assert history.max_scroll_y > 0
+        replies = app.screen.query_one("#commit-replies")
+        assert len(app.screen.current_level.replies) == 12
+        assert len(replies.children) == 12
+        assert client.reply_cursors == [("parent-id", None)]
+
+        await pilot.press("j", "j", "k")
+        assert replies.index == 0
+        history.scroll_y = 0
+        await pilot._post_mouse_events(
+            [MouseScrollDown],
+            widget=history,
+            offset=(3, 3),
+        )
+        assert history.scroll_y > 0
+        history.scroll_y = 0
+        await pilot.press("ctrl+j")
+        assert history.scroll_y > 0
+        await pilot.press("ctrl+k")
+        assert history.scroll_y == 0
+        replies.scroll_y = replies.max_scroll_y
+        await pilot.pause(0.1)
+        assert client.reply_cursors == [("parent-id", None), ("parent-id", "older")]
+        assert len(replies.children) == 13
+
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        assert len(app.screen.levels) == 2
+        assert client.reply_cursors[-1] == ("reply-0", None)
+        thread_context = app.screen.query_one("#thread-context", LinkedText).content
+        assert isinstance(thread_context, Text)
+        assert thread_context.plain.index(original_body.strip()) < thread_context.plain.index("Reply 0")
+
+        await pilot.press("u")
+        await pilot.pause()
+        assert len(app.screen.levels) == 1
+        assert len(app.screen.query_one("#commit-replies").children) == 13
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, CommitDetailScreen)
+
+
+@pytest.mark.asyncio
+async def test_ctrl_r_replies_to_root_and_selected_comment() -> None:
+    root = ApiCommit(
+        "root-id",
+        "octocat",
+        "The Octocat",
+        "Original post",
+        "2026-10-20T18:00:00Z",
+        0,
+        1,
+    )
+    comment = ApiCommit(
+        "comment-id",
+        "octocat",
+        "The Octocat",
+        "A comment",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+    )
+
+    class FakeClient:
+        submissions = []
+        reply_requests = []
+
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            return ApiLog((root,), None, False, 0, ())
+
+        def get_commit_detail(self, commit_id):
+            return ApiCommitDetail(root, ())
+
+        def get_replies(self, commit_id, cursor=None) -> ApiLog:
+            self.reply_requests.append((commit_id, cursor))
+            if commit_id == root.id:
+                refreshed_comment = ApiCommit(
+                    comment.id,
+                    comment.username,
+                    comment.author_name,
+                    comment.body,
+                    comment.created_at,
+                    comment.stars_count,
+                    sum(parent_id == comment.id for _, parent_id, _ in self.submissions),
+                )
+                return ApiLog((refreshed_comment,), None, False, 0, ())
+            return ApiLog((), None, False, 0, ())
+
+        def create_commit(
+            self,
+            body: str,
+            parent_id: str | None = None,
+            quoted_commit_id: str | None = None,
+        ) -> ApiCommit:
+            self.submissions.append((body, parent_id, quoted_commit_id))
+            return ApiCommit(
+                f"posted-{len(self.submissions)}",
+                "octocat",
+                "The Octocat",
+                body,
+                "2026-10-20T18:00:00Z",
+                0,
+                0,
+            )
+
+    app = DevNullApp()
+    client = FakeClient()
+
+    async with app.run_test() as pilot:
+        app._set_authenticated_user(
+            client,
+            ApiUser("octocat", "The Octocat", None, None),
+        )
+        app._show_log("latest")
+        await pilot.pause(0.1)
+        app.query_one("#latest-list").index = 0
+        app.query_one("#latest-list").focus()
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+
+        assert isinstance(app.screen, CommitDetailScreen)
+        await pilot.press("ctrl+r")
+        assert isinstance(app.screen, CommitComposerScreen)
+        assert app.screen.commit == root
+        app.screen.query_one("#commit-body", TextArea).text = "Reply to the root."
+        await pilot.press("ctrl+p")
+        await pilot.pause(0.1)
+
+        assert client.submissions == [("Reply to the root.", root.id, None)]
+        assert isinstance(app.screen, CommitDetailScreen)
+        assert client.reply_requests[-1] == (root.id, None)
+
+        app.screen.query_one("#commit-replies").index = 0
+        await pilot.press("ctrl+r")
+        assert isinstance(app.screen, CommitComposerScreen)
+        assert app.screen.commit == comment
+        app.screen.query_one("#commit-body", TextArea).text = "Reply to the comment."
+        await pilot.press("ctrl+p")
+        await pilot.pause(0.1)
+
+        assert client.submissions[1] == ("Reply to the comment.", comment.id, None)
+        assert isinstance(app.screen, CommitDetailScreen)
+        assert len(app.screen.levels) == 1
+        assert app.screen.current_level.commit == root
+        assert app.screen.current_level.selected_index == 0
+        assert app.screen.current_level.replies[0].replies_count == 1
+        assert client.reply_requests == [
+            (root.id, None),
+            (root.id, None),
+            (root.id, None),
+        ]
+
+
+def test_commit_links_render_as_clickable_hyperlinks() -> None:
+    commit = ApiCommit(
+        "linked-id",
+        "octocat",
+        "The Octocat",
+        "Visit https://example.com/docs (and https://dev-null.sh/).",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+    )
+    rendered = _commit_display(commit, 600, show_counts=True)
+
+    links = [
+        span.style.link
+        for span in rendered.spans
+        if isinstance(span.style, Style) and span.style.link is not None
+    ]
+    assert links == ["https://example.com/docs", "https://dev-null.sh/"]
+    assert rendered.plain.endswith(" (and https://dev-null.sh/).\n★ 0   ↩ 0")
+
+
+@pytest.mark.asyncio
+async def test_clicking_commit_link_opens_browser(monkeypatch) -> None:
+    opened_urls = []
+
+    def fake_open(url: str) -> bool:
+        opened_urls.append(url)
+        return True
+
+    monkeypatch.setattr("dev_null_tty.webbrowser.open", fake_open)
+
+    class LinkHarness(App[None]):
+        def compose(self) -> ComposeResult:
+            yield LinkedText(_linkify_urls("https://example.com"), id="commit-link")
+
+    async with LinkHarness().run_test() as pilot:
+        await pilot.click("#commit-link", offset=(5, 0))
+        await pilot.pause()
+
+    assert opened_urls == ["https://example.com"]
 
 
 @pytest.mark.asyncio
@@ -763,6 +1251,288 @@ def test_get_log_sends_cursor_and_parses_journal(monkeypatch, tmp_path) -> None:
         "2026-10-20T18:00:00Z",
         7,
         2,
+    )
+
+
+def test_get_replies_sends_signed_cursor_and_parses_replies(monkeypatch, tmp_path) -> None:
+    import dev_null_tty.api as api
+
+    signed = {}
+    monkeypatch.setattr(
+        api,
+        "signed_headers",
+        lambda method, path, body, key_path: signed.update(
+            method=method, path=path, body=body
+        )
+        or {},
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            pass
+
+        def geturl(self) -> str:
+            return (
+                "https://dev-null.sh/api/v1/commits/commit%2Fid/replies"
+                "?newest=1&cursor=next%2Fpage"
+            )
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "data": [
+                        {
+                            "id": "reply-id",
+                            "body": "A useful reply.",
+                            "created_at": "2026-10-20T18:00:00Z",
+                            "stars_count": 1,
+                            "replies_count": 0,
+                            "author": {
+                                "username": "octocat",
+                                "name": "The Octocat",
+                            },
+                        }
+                    ],
+                    "meta": {"next_cursor": "older"},
+                }
+            ).encode("utf-8")
+
+    class Opener:
+        def open(self, request, timeout: int) -> Response:
+            return Response()
+
+    client = SignedApiClient(tmp_path / "id_ed25519")
+    client._opener = Opener()
+
+    replies = client.get_replies("commit/id", "next/page")
+
+    assert signed == {
+        "method": "GET",
+        "path": "/api/v1/commits/commit%2Fid/replies?newest=1&cursor=next%2Fpage",
+        "body": b"",
+    }
+    assert replies.next_cursor == "older"
+    assert replies.commits == (
+        ApiCommit(
+            "reply-id",
+            "octocat",
+            "The Octocat",
+            "A useful reply.",
+            "2026-10-20T18:00:00Z",
+            1,
+            0,
+        ),
+    )
+
+
+def test_get_notifications_sends_signed_cursor_and_parses_groups(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import dev_null_tty.api as api
+
+    signed = {}
+    monkeypatch.setattr(
+        api,
+        "signed_headers",
+        lambda method, path, body, key_path: signed.update(
+            method=method,
+            path=path,
+            body=body,
+        )
+        or {},
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            pass
+
+        def geturl(self) -> str:
+            return "https://dev-null.sh/api/v1/notifications?cursor=next%2Fpage"
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "data": [
+                        {
+                            "id": "notification-id",
+                            "type": "starred",
+                            "subject_id": "commit-id",
+                            "reason": None,
+                            "read_at": None,
+                            "created_at": "2026-10-20T18:00:00Z",
+                            "actor": {
+                                "username": "octocat",
+                                "name": "The Octocat",
+                                "avatar_url": None,
+                                "bio": None,
+                            },
+                            "actors": [],
+                            "group_id": "group-id",
+                            "event_count": 2,
+                            "actors_count": 2,
+                            "unread_count": 1,
+                            "commit": {
+                                "id": "commit-id",
+                                "body": "A commit that was starred.",
+                                "created_at": "2026-10-20T17:00:00Z",
+                                "stars_count": 2,
+                                "replies_count": 0,
+                                "author": {
+                                    "username": "reader",
+                                    "name": "Reader",
+                                },
+                            },
+                        }
+                    ],
+                    "links": {"next": "https://dev-null.sh/api/v1/notifications?cursor=next"},
+                    "meta": {"next_cursor": "older"},
+                    "read_at": "2026-10-20T18:01:00Z",
+                    "filters": {"type": "all"},
+                }
+            ).encode("utf-8")
+
+    class Opener:
+        request = None
+
+        def open(self, request, timeout: int) -> Response:
+            self.request = request
+            return Response()
+
+    client = SignedApiClient(tmp_path / "id_ed25519")
+    opener = Opener()
+    client._opener = opener
+
+    page = client.get_notifications("next/page")
+
+    assert signed == {
+        "method": "GET",
+        "path": "/api/v1/notifications?cursor=next%2Fpage",
+        "body": b"",
+    }
+    assert page.next_cursor == "older"
+    assert page.read_at == "2026-10-20T18:01:00Z"
+    assert page.notifications == (
+        ApiNotification(
+            "notification-id",
+            "starred",
+            "2026-10-20T18:00:00Z",
+            ApiUser("octocat", "The Octocat", None, None),
+            2,
+            2,
+            1,
+            None,
+            ApiCommit(
+                "commit-id",
+                "reader",
+                "Reader",
+                "A commit that was starred.",
+                "2026-10-20T17:00:00Z",
+                2,
+                0,
+            ),
+        ),
+    )
+
+
+def test_get_commit_detail_parses_ancestors_and_tombstones(monkeypatch, tmp_path) -> None:
+    import dev_null_tty.api as api
+
+    signed = {}
+    monkeypatch.setattr(
+        api,
+        "signed_headers",
+        lambda method, path, body, key_path: signed.update(
+            method=method,
+            path=path,
+            body=body,
+        )
+        or {},
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            pass
+
+        def geturl(self) -> str:
+            return "https://dev-null.sh/api/v1/commits/reply-id"
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "data": {
+                        "id": "reply-id",
+                        "body": "The latest reply.",
+                        "created_at": "2026-10-20T18:00:00Z",
+                        "author": {"username": "octocat", "name": "The Octocat"},
+                    },
+                    "ancestors": [
+                        {
+                            "id": "root-id",
+                            "body": "Original post.",
+                            "created_at": "2026-10-20T16:00:00Z",
+                            "author": {"username": "root", "name": "Root"},
+                        },
+                        {
+                            "id": "deleted-id",
+                            "parent_id": "root-id",
+                            "deleted_at": "2026-10-20T17:00:00Z",
+                            "replies_count": 1,
+                        },
+                    ],
+                }
+            ).encode("utf-8")
+
+    class Opener:
+        def open(self, request, timeout: int) -> Response:
+            return Response()
+
+    client = SignedApiClient(tmp_path / "id_ed25519")
+    client._opener = Opener()
+
+    detail = client.get_commit_detail("reply-id")
+
+    assert signed == {
+        "method": "GET",
+        "path": "/api/v1/commits/reply-id",
+        "body": b"",
+    }
+    assert detail.commit == ApiCommit(
+        "reply-id",
+        "octocat",
+        "The Octocat",
+        "The latest reply.",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+    )
+    assert detail.ancestors == (
+        ApiCommitContext(
+            "root-id",
+            "root",
+            "Root",
+            "Original post.",
+            "2026-10-20T16:00:00Z",
+            0,
+        ),
+        ApiCommitContext(
+            "deleted-id",
+            None,
+            None,
+            None,
+            None,
+            1,
+            deleted=True,
+        ),
     )
 
 

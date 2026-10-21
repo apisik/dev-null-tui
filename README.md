@@ -8,10 +8,20 @@ The **Following**, **Latest**, and **Trending** journals load real commits from
 the signed `/api/v1/log/{log}` endpoint after sign-in. Each journal supports
 automatic cursor-based infinite scrolling and commit search. Guest users can
 view the profile and sign in; journals require an approved device. Signed-in
-users can publish commits, reply to a commit, or quote it. The modal composer
-shows the original commit above the editor for replies and quotes, and submits
-through the signed `POST /api/v1/commits` endpoint. Press `Ctrl+Q` or `Escape`
-to close the composer.
+users can browse a cursor-paginated notifications inbox, publish commits,
+reply to a commit, or quote it. Opening the notifications inbox marks
+notifications read on /dev/null. Click detected
+HTTP(S) links with the mouse to open them in your default browser. The modal
+composer shows the original commit above the editor for replies and quotes,
+and submits through the signed `POST /api/v1/commits` endpoint. Press
+`Ctrl+P` to submit. Press `Ctrl+Q` or `Escape` to close the composer.
+Press `Enter` on a selected journal entry to open its full commit and replies.
+Use `j` / `k` to navigate replies, `Enter` to follow a reply into its own
+thread, `u` to move to the parent comment, and `Escape` to return to the
+previous screen. Commit details show the full ancestor chain in a fixed-height
+scrollable pane above the replies. Press `Ctrl+J` / `Ctrl+K` or use the mouse
+wheel to scroll the ancestor history. Press `Ctrl+R` to reply to the thread's
+main commit or selected comment. Scroll the replies list to load older replies.
 
 The profile's **Sign in with GitHub** action starts the documented PKCE
 device authorization flow. To preserve existing sign-ins, the app keeps its
@@ -58,10 +68,17 @@ uv run dev-null-tty
 Keyboard shortcuts:
 
 - `h` / `l` — Previous / next journal
-- `j` / `k` — Next / previous commit
+- `n` — Open notifications
+- `j` / `k` — Next / previous commit or notification
+- `Enter` — Open the selected commit/notification or follow a selected reply
+- `Ctrl+J` / `Ctrl+K` — Scroll commit thread history
+- `Ctrl+R` — Reply to the thread's main commit or selected comment
+- `u` — Move up to the parent comment in a thread
+- `Escape` — Return to the previous screen
 - `Shift+C` — New commit
 - `Shift+Q` — Quote selected commit
 - `Shift+R` — Reply to selected commit
+- `Ctrl+P` — Submit the commit, reply, or quote
 - `q` — Quit
 
 ## Test

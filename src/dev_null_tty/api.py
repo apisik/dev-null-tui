@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 API_ORIGIN = "https://dev-null.sh"
 SIGNATURE_NAMESPACE = "devnull-api"
@@ -48,12 +48,49 @@ class ApiCommit:
 
 
 @dataclass(frozen=True)
+class ApiCommitContext:
+    id: str
+    username: str | None
+    author_name: str | None
+    body: str | None
+    created_at: str | None
+    replies_count: int
+    deleted: bool = False
+
+
+@dataclass(frozen=True)
+class ApiCommitDetail:
+    commit: ApiCommit
+    ancestors: tuple[ApiCommitContext, ...]
+
+
+@dataclass(frozen=True)
 class ApiLog:
     commits: tuple[ApiCommit, ...]
     next_cursor: str | None
     is_ranked: bool
     new_commits_count: int
     suggestions: tuple[ApiUser, ...]
+
+
+@dataclass(frozen=True)
+class ApiNotification:
+    id: str
+    type: str
+    created_at: str
+    actor: ApiUser | None
+    actors_count: int
+    event_count: int
+    unread_count: int
+    reason: str | None
+    commit: ApiCommit | None
+
+
+@dataclass(frozen=True)
+class ApiNotifications:
+    notifications: tuple[ApiNotification, ...]
+    next_cursor: str | None
+    read_at: str | None
 
 
 @dataclass(frozen=True)
@@ -350,6 +387,38 @@ class SignedApiClient:
         payload = self._request("GET", path)
         return self._log_from_payload(payload)
 
+    def get_replies(self, commit_id: str, cursor: str | None = None) -> ApiLog:
+        path = f"/api/v1/commits/{quote(commit_id, safe='')}/replies"
+        query = {"newest": "1"}
+        if cursor is not None:
+            query["cursor"] = cursor
+        payload = self._request("GET", f"{path}?{urlencode(query)}")
+        return self._log_from_payload(payload)
+
+    def get_commit_detail(self, commit_id: str) -> ApiCommitDetail:
+        path = f"/api/v1/commits/{quote(commit_id, safe='')}"
+        payload = self._request("GET", path)
+        try:
+            commit_payload = payload["data"]
+            ancestors_payload = payload["ancestors"]
+            if not isinstance(ancestors_payload, list):
+                raise TypeError
+            commit = self._commit_from_payload(commit_payload)
+            ancestors = tuple(
+                self._commit_context_from_payload(ancestor)
+                for ancestor in ancestors_payload
+            )
+            return ApiCommitDetail(commit, ancestors)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ApiError("The API returned an unexpected commit-detail response.") from error
+
+    def get_notifications(self, cursor: str | None = None) -> ApiNotifications:
+        path = "/api/v1/notifications"
+        if cursor is not None:
+            path = f"{path}?{urlencode({'cursor': cursor})}"
+        payload = self._request("GET", path)
+        return self._notifications_from_payload(payload)
+
     def create_commit(
         self,
         body: str,
@@ -433,6 +502,107 @@ class SignedApiClient:
             raise ApiError("The API returned an unexpected log response.") from error
 
     @staticmethod
+    def _notifications_from_payload(payload: dict) -> ApiNotifications:
+        try:
+            entries = payload["data"]
+            meta = payload.get("meta", {})
+            if not isinstance(entries, list) or not isinstance(meta, dict):
+                raise TypeError
+            notifications = tuple(
+                SignedApiClient._notification_from_payload(entry) for entry in entries
+            )
+            next_cursor = meta.get("next_cursor")
+            read_at = payload.get("read_at")
+            if next_cursor is not None and not isinstance(next_cursor, str):
+                raise TypeError
+            if read_at is not None and not isinstance(read_at, str):
+                raise TypeError
+            return ApiNotifications(notifications, next_cursor, read_at)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ApiError("The API returned an unexpected notifications response.") from error
+
+    @staticmethod
+    def _notification_from_payload(payload: dict) -> ApiNotification:
+        try:
+            if not isinstance(payload, dict):
+                raise TypeError
+            actor_payload = payload.get("actor")
+            actor = (
+                SignedApiClient._suggestion_from_payload(actor_payload)
+                if actor_payload is not None
+                else None
+            )
+            commit_payload = payload.get("commit")
+            commit = None
+            if commit_payload is not None:
+                if not isinstance(commit_payload, dict):
+                    raise TypeError
+                if commit_payload.get("deleted_at") is None:
+                    author = commit_payload["author"]
+                    if not isinstance(author, dict):
+                        raise TypeError
+                    commit = ApiCommit(
+                        id=commit_payload["id"],
+                        username=author["username"],
+                        author_name=author.get("name"),
+                        body=commit_payload["body"],
+                        created_at=commit_payload["created_at"],
+                        stars_count=commit_payload.get("stars_count", 0),
+                        replies_count=commit_payload.get("replies_count", 0),
+                    )
+                    if not all(
+                        isinstance(value, str)
+                        for value in (
+                            commit.id,
+                            commit.username,
+                            commit.body,
+                            commit.created_at,
+                        )
+                    ):
+                        raise TypeError
+                    if commit.author_name is not None and not isinstance(
+                        commit.author_name, str
+                    ):
+                        raise TypeError
+                    if any(
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 0
+                        for value in (commit.stars_count, commit.replies_count)
+                    ):
+                        raise TypeError
+            notification = ApiNotification(
+                id=payload["id"],
+                type=payload["type"],
+                created_at=payload["created_at"],
+                actor=actor,
+                actors_count=payload["actors_count"],
+                event_count=payload["event_count"],
+                unread_count=payload["unread_count"],
+                reason=payload.get("reason"),
+                commit=commit,
+            )
+            if not all(
+                isinstance(value, str)
+                for value in (notification.id, notification.type, notification.created_at)
+            ):
+                raise TypeError
+            if notification.reason is not None and not isinstance(notification.reason, str):
+                raise TypeError
+            if any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in (
+                    notification.actors_count,
+                    notification.event_count,
+                    notification.unread_count,
+                )
+            ):
+                raise TypeError
+            return notification
+        except (KeyError, TypeError, ValueError) as error:
+            raise ApiError("The API returned a malformed notification.") from error
+
+    @staticmethod
     def _commit_from_payload(payload: dict) -> ApiCommit:
         try:
             author = payload["author"]
@@ -442,8 +612,8 @@ class SignedApiClient:
                 author_name=author.get("name"),
                 body=payload["body"],
                 created_at=payload["created_at"],
-                stars_count=payload["stars_count"],
-                replies_count=payload["replies_count"],
+                stars_count=payload.get("stars_count", 0),
+                replies_count=payload.get("replies_count", 0),
             )
             if not all(
                 isinstance(value, str)
@@ -467,6 +637,44 @@ class SignedApiClient:
             return commit
         except (KeyError, TypeError, ValueError) as error:
             raise ApiError("The API returned a malformed commit in a log.") from error
+
+    @staticmethod
+    def _commit_context_from_payload(payload: dict) -> ApiCommitContext:
+        try:
+            if not isinstance(payload, dict):
+                raise TypeError
+            commit_id = payload["id"]
+            if not isinstance(commit_id, str):
+                raise TypeError
+            deleted = payload.get("deleted_at") is not None
+            replies_count = payload.get("replies_count", 0)
+            if (
+                not isinstance(replies_count, int)
+                or isinstance(replies_count, bool)
+                or replies_count < 0
+            ):
+                raise TypeError
+            if deleted:
+                return ApiCommitContext(
+                    id=commit_id,
+                    username=None,
+                    author_name=None,
+                    body=None,
+                    created_at=None,
+                    replies_count=replies_count,
+                    deleted=True,
+                )
+            commit = SignedApiClient._commit_from_payload(payload)
+            return ApiCommitContext(
+                id=commit.id,
+                username=commit.username,
+                author_name=commit.author_name,
+                body=commit.body,
+                created_at=commit.created_at,
+                replies_count=commit.replies_count,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ApiError("The API returned a malformed commit ancestor.") from error
 
     @staticmethod
     def _suggestion_from_payload(payload: dict) -> ApiUser:
