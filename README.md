@@ -70,4 +70,20 @@ Keyboard shortcuts:
 uv run pytest
 ```
 
+## Release
+
+Configure a PyPI trusted publisher for this GitHub repository using the
+`.github/workflows/publish.yml` workflow and the `pypi` environment. Update the
+version in `pyproject.toml` (and refresh `uv.lock`), then push a matching
+version tag, for example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow checks that the tag matches the project version, runs the tests,
+builds the wheel and source distribution, and publishes them to PyPI using
+OpenID Connect. No PyPI API token is required.
+
 The upstream project is [nunomaduro/dev-null.sh](https://github.com/nunomaduro/dev-null.sh).
