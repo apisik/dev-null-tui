@@ -671,6 +671,7 @@ class DevNullApp(App[None]):
         ("j", "next_commit", "Next commit"),
         ("k", "previous_commit", "Previous commit"),
         ("l", "next_journal", "Next journal"),
+        ("r", "refresh_log", "Refresh journal"),
         Binding("C", "new_commit", "New commit", key_display="Shift+C"),
         Binding("shift+c", "new_commit", show=False),
         Binding("Q", "quote_selected", "Quote", key_display="Shift+Q"),
@@ -699,6 +700,7 @@ class DevNullApp(App[None]):
             "latest": False,
             "trending": False,
         }
+        self.log_refresh_generation = 0
         self.log_versions: dict[LogName, int] = {
             "following": 0,
             "latest": 0,
@@ -877,6 +879,8 @@ class DevNullApp(App[None]):
 
     def _show_log(self, log_name: LogName) -> None:
         self.active_log = log_name
+        self.log_refresh_generation += 1
+        refresh_generation = self.log_refresh_generation
         titles = {
             "following": "LOG / FOLLOWING",
             "latest": "LOG / LATEST",
@@ -885,21 +889,32 @@ class DevNullApp(App[None]):
         self._show_view(f"{log_name}-view", titles[log_name], f"{log_name}-log")
         if self.log_loaded[log_name]:
             self.run_worker(
-                self._refresh_log_after_idle(log_name),
+                self._refresh_log_after_idle(log_name, refresh_generation),
                 group="log-auto-refresh",
                 exclusive=True,
             )
         else:
             self._start_log_load(log_name, reset=True)
 
-    async def _refresh_log_after_idle(self, log_name: LogName) -> None:
+    async def _refresh_log_after_idle(
+        self,
+        log_name: LogName,
+        refresh_generation: int,
+    ) -> None:
         await asyncio.sleep(2)
         if (
             self.is_running
+            and self.log_refresh_generation == refresh_generation
             and self.active_log == log_name
             and self.query_one("#views", ContentSwitcher).current == f"{log_name}-view"
         ):
             self._start_log_load(log_name, reset=True)
+
+    def action_refresh_log(self) -> None:
+        if self.query_one("#views", ContentSwitcher).current != f"{self.active_log}-view":
+            return
+        self.log_refresh_generation += 1
+        self._start_log_load(self.active_log, reset=True)
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {

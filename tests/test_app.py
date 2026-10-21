@@ -186,6 +186,54 @@ async def test_cached_journals_refresh_only_after_selection_settles() -> None:
 
 
 @pytest.mark.asyncio
+async def test_r_refreshes_active_journal() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            self.calls += 1
+            return ApiLog(
+                (
+                    ApiCommit(
+                        f"latest-{self.calls}",
+                        "octocat",
+                        "The Octocat",
+                        f"Journal version {self.calls}",
+                        "2026-10-20T18:00:00Z",
+                        0,
+                        0,
+                    ),
+                ),
+                None,
+                False,
+                0,
+                (),
+            )
+
+    app = DevNullApp()
+    client = FakeClient()
+    app.api_client = client
+
+    async with app.run_test() as pilot:
+        app._show_log("latest")
+        for _ in range(20):
+            if client.calls == 1 and not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
+
+        app.query_one("#latest-list").focus()
+        await pilot.press("r")
+        for _ in range(20):
+            if client.calls == 2 and not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
+
+        assert client.calls == 2
+        assert app.query_one("#latest-list").children[0].commit.id == "latest-2"
+
+
+@pytest.mark.asyncio
 async def test_notifications_view_loads_pages_and_opens_commit() -> None:
     notification_commit = ApiCommit(
         "notification-commit",

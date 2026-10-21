@@ -69,6 +69,7 @@ uv run dev-null-tty
 Keyboard shortcuts:
 
 - `h` / `l` — Previous / next journal
+- `r` — Refresh the active journal
 - `n` — Open notifications
 - `j` / `k` — Next / previous commit or notification
 - `Enter` — Open the selected commit/notification or follow a selected reply
