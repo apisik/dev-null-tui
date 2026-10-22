@@ -128,6 +128,28 @@ CommitComposerScreen {
     border: round $muted;
 }
 
+#mention-status,
+#mention-suggestions {
+    position: absolute;
+    layer: overlay;
+    width: 42;
+}
+
+#mention-status {
+    display: none;
+    height: auto;
+    color: $muted;
+}
+
+#mention-suggestions {
+    display: none;
+    height: auto;
+    max-height: 8;
+    padding: 0;
+    border: round $muted;
+    background: $darker-background;
+}
+
 #composer-dialog.new-commit #commit-body {
     height: 1fr;
     min-height: 7;

@@ -65,6 +65,39 @@ def avoid_live_session_restore(monkeypatch) -> None:
     monkeypatch.setattr("dev_null_tty.register_uri_handler", lambda: None)
 
 
+def test_search_users_uses_public_search_route() -> None:
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return "https://dev-null.test/search/users?q=alice+%26+bob"
+
+        def read(self) -> bytes:
+            return b'{"users":[{"username":"alice","name":"Alice"}]}'
+
+    class FakeOpener:
+        def __init__(self) -> None:
+            self.request = None
+
+        def open(self, request, timeout: float):
+            self.request = request
+            assert timeout == 20
+            return FakeResponse()
+
+    client = SignedApiClient(Path("unused"), origin="https://dev-null.test")
+    opener = FakeOpener()
+    client._opener = opener
+
+    assert client.search_users("alice & bob") == (ApiUser("alice", "Alice", None, None),)
+    assert opener.request.full_url == "https://dev-null.test/search/users?q=alice+%26+bob"
+    assert opener.request.get_header("Accept") == "application/json"
+    assert opener.request.get_header("X-ssh-signature") is None
+
+
 @pytest.mark.asyncio
 async def test_app_starts_on_latest_log() -> None:
     app = DevNullApp()
@@ -80,6 +113,65 @@ async def test_app_starts_on_latest_log() -> None:
         assert not app.query("#reply-selected")
         assert not app.query("#quote-selected")
         assert not app.query("#search")
+
+
+@pytest.mark.asyncio
+async def test_composer_searches_and_selects_mention_suggestions() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.search_queries: list[str] = []
+
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            commit = ApiCommit(
+                "commit-1",
+                "octocat",
+                "The Octocat",
+                "Building in public.",
+                "2026-10-20T18:00:00Z",
+                0,
+                0,
+            )
+            return ApiLog((commit,), None, False, 0, ())
+
+        def search_users(self, query: str) -> tuple[ApiUser, ...]:
+            self.search_queries.append(query)
+            return (ApiUser("alice", "Alice", None, None),)
+
+    app = DevNullApp()
+    client = FakeClient()
+    app.api_client = client
+
+    async with app.run_test() as pilot:
+        app._show_log("latest")
+        for _ in range(20):
+            if app.log_loaded["latest"] and not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
+        assert app.log_loaded["latest"]
+
+        app._begin_composition()
+        await pilot.pause()
+        text_area = app.screen.query_one("#commit-body", TextArea)
+        dialog = app.screen.query_one("#composer-dialog")
+        dialog_region = dialog.region
+
+        await pilot.press("@", "a", "l", "i")
+        await pilot.pause(0.35)
+        suggestions = app.screen.query_one("#mention-suggestions")
+        assert suggestions.display
+        assert dialog.region == dialog_region
+        assert client.search_queries == ["ali"]
+        cursor_x, cursor_y = text_area.cursor_screen_offset
+        assert suggestions.region.x == cursor_x
+        assert suggestions.region.y == cursor_y + 1
+        help_text = str(app.screen.query_one("#composer-help", Static).render())
+        assert "suggestions" not in help_text
+        assert "insert @" not in help_text
+
+        await pilot.press("down", "enter")
+
+        assert text_area.text == "@alice "
+        assert not suggestions.display
 
 
 @pytest.mark.asyncio
@@ -1090,6 +1182,9 @@ async def test_user_can_submit_commits_and_replies() -> None:
         def get_log(self, log_name, cursor=None) -> ApiLog:
             return ApiLog((target,), None, False, 0, ())
 
+        def search_users(self, query: str) -> tuple[ApiUser, ...]:
+            return ()
+
         def create_commit(
             self,
             body: str,
@@ -1195,6 +1290,9 @@ async def test_user_can_attach_images_to_a_new_commit(tmp_path, monkeypatch) -> 
 
         def get_log(self, log_name, cursor=None) -> ApiLog:
             return ApiLog((target,), None, False, 0, ())
+
+        def search_users(self, query: str) -> tuple[ApiUser, ...]:
+            return ()
 
         def create_commit_with_images(
             self,
@@ -1511,6 +1609,9 @@ async def test_ctrl_r_replies_to_root_and_selected_comment() -> None:
 
         def get_log(self, log_name, cursor=None) -> ApiLog:
             return ApiLog((root,), None, False, 0, ())
+
+        def search_users(self, query: str) -> tuple[ApiUser, ...]:
+            return ()
 
         def get_commit_detail(self, commit_id):
             return ApiCommitDetail(root, ())

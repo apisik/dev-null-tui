@@ -408,6 +408,42 @@ class SignedApiClient:
         payload = self._request("GET", "/api/v1/me")
         return self._user_from_payload(payload)
 
+    def search_users(self, query: str) -> tuple[ApiUser, ...]:
+        path = f"/search/users?{urlencode({'q': query})}"
+        request = urllib.request.Request(
+            f"{self.origin}{path}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "dev-null-tty",
+            },
+            method="GET",
+        )
+        try:
+            with self._opener.open(request, timeout=20) as response:
+                response_origin = urlsplit(response.geturl())
+                origin = urlsplit(self.origin)
+                if (
+                    response_origin.scheme != "https"
+                    or response_origin.netloc.casefold() != origin.netloc.casefold()
+                ):
+                    raise ApiError("The user-search response came from an unexpected origin.")
+                payload = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            raise ApiError(f"User search returned HTTP {error.code}.") from error
+        except urllib.error.URLError as error:
+            raise ApiError(f"Could not reach {self.origin} for user search: {error.reason}") from error
+        except json.JSONDecodeError as error:
+            raise ApiError("User search returned invalid JSON.") from error
+        if not isinstance(payload, dict):
+            raise ApiError("User search returned an unexpected response.")
+        try:
+            users = payload["users"]
+            if not isinstance(users, list):
+                raise TypeError
+            return tuple(self._search_user_from_payload(user) for user in users)
+        except (KeyError, TypeError) as error:
+            raise ApiError("User search returned an unexpected response.") from error
+
     def get_log(self, log_name: LogName, cursor: str | None = None) -> ApiLog:
         if log_name not in {"following", "latest", "trending"}:
             raise ValueError(f"Unsupported log: {log_name}")
@@ -1111,6 +1147,24 @@ class SignedApiClient:
             return user
         except (KeyError, TypeError) as error:
             raise ApiError("The API returned a malformed log suggestion.") from error
+
+    @staticmethod
+    def _search_user_from_payload(payload: dict) -> ApiUser:
+        try:
+            user = ApiUser(
+                username=payload["username"],
+                name=payload.get("name"),
+                avatar_url=payload.get("avatar_url"),
+                bio=payload.get("bio"),
+            )
+            if not isinstance(user.username, str) or any(
+                value is not None and not isinstance(value, str)
+                for value in (user.name, user.avatar_url, user.bio)
+            ):
+                raise TypeError
+            return user
+        except (KeyError, TypeError) as error:
+            raise ApiError("User search returned a malformed user.") from error
 
     def _request(self, method: str, path_and_query: str, body: bytes = b"") -> dict:
         headers = signed_headers(method, path_and_query, body, self.key_path)

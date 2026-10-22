@@ -16,7 +16,9 @@ composer shows the original commit above the editor for replies and quotes,
 and submits through the signed `POST /api/v1/commits` endpoint. Press
 `Ctrl+P` to submit. Press `Ctrl+V` in the composer to edit the draft in Neovim;
 the text returns to the composer when Neovim exits successfully. Press `Ctrl+Q`
-or `Escape` to close the composer.
+or `Escape` to close the composer. Typing `@` and part of a username opens a
+server-backed dropdown of matching users; press `Down` to focus it and `Enter`
+to insert the selected username.
 New commits and replies can include up to three JPEG, PNG, or WebP images
 (maximum 10 MB each). Press `Ctrl+F` or select **Find images** to open `fzf`
 with image files under your home directory. Type to filter, use `Up` / `Down`
@@ -140,6 +142,7 @@ Keyboard shortcuts:
 - `Shift+R` — Reply to selected commit
 - `Ctrl+F` (composer) — Find and attach images with `fzf`
 - `Ctrl+V` (composer) — Edit the draft in Neovim
+- `Down` / `Enter` (composer) — Choose and insert a matching `@mention`
 - `Ctrl+P` — Submit the commit, reply, or quote
 - `q` — Quit
 

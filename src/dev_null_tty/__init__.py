@@ -1039,6 +1039,61 @@ class NotificationsListView(ListView):
             self.app.call_after_refresh(self.app._on_notifications_scroll_end)
 
 
+class MentionSuggestionItem(ListItem):
+    def __init__(self, user: ApiUser) -> None:
+        label = Text(f"@{user.username}", style="bold")
+        if user.name:
+            label.append(f"  {user.name}", style="dim")
+        super().__init__(Static(label))
+        self.user = user
+
+
+class MentionSuggestionsList(ListView):
+    BINDINGS = [
+        Binding("escape", "dismiss_suggestions", "Dismiss suggestions", show=False, priority=True),
+    ]
+
+    def action_dismiss_suggestions(self) -> None:
+        self.display = False
+        self.screen.query_one("#mention-status", Static).display = False
+        self.screen.query_one("#commit-body", MentionTextArea).focus()
+
+
+class MentionTextArea(TextArea):
+    BINDINGS = [
+        Binding("down", "focus_mention_suggestions", "Mention suggestions", show=False),
+    ]
+
+    def mention_query(self) -> tuple[str, int, int] | None:
+        row, column = self.cursor_location
+        text_before_cursor = self.document[row][:column]
+        match = re.search(r"(^|[^\w@])@([A-Za-z0-9_.-]*)$", text_before_cursor)
+        if match is None:
+            return None
+        return match.group(2), row, match.start(2)
+
+    def insert_mention(self, username: str) -> bool:
+        mention = self.mention_query()
+        if mention is None:
+            return False
+        _, row, start_column = mention
+        end_column = self.cursor_location[1]
+        self.replace(
+            f"{username} ",
+            (row, start_column),
+            (row, end_column),
+        )
+        return True
+
+    def action_focus_mention_suggestions(self) -> None:
+        suggestions = self.screen.query_one("#mention-suggestions", MentionSuggestionsList)
+        if not suggestions.display or not suggestions.children:
+            self.action_cursor_down()
+            return
+        suggestions.index = 0
+        suggestions.focus()
+
+
 class CommitComposerScreen(ModalScreen[None]):
     BINDINGS = [
         Binding("ctrl+f", "find_images", "Attach images", show=False, priority=True),
@@ -1059,6 +1114,8 @@ class CommitComposerScreen(ModalScreen[None]):
         self,
         mode: ComposerMode,
         commit: ApiCommit | None = None,
+        *,
+        search_users: Callable[[str], tuple[ApiUser, ...]] | None = None,
     ) -> None:
         if mode != "new" and commit is None:
             raise ValueError(f"A {mode} composer needs a selected commit.")
@@ -1066,6 +1123,10 @@ class CommitComposerScreen(ModalScreen[None]):
         self.mode = mode
         self.commit = commit
         self.image_paths: list[Path] = []
+        self.search_users = search_users
+        self._mention_search_generation = 0
+        self._active_mention_query: str | None = None
+        self._mention_anchor: tuple[int, int] | None = None
 
     def compose(self) -> ComposeResult:
         if self.mode == "reply":
@@ -1092,7 +1153,7 @@ class CommitComposerScreen(ModalScreen[None]):
                 )
             with ContentSwitcher(initial="composer-form", id="composer-mode"):
                 with Vertical(id="composer-form"):
-                    yield TextArea(
+                    yield MentionTextArea(
                         placeholder="What would you like to share?",
                         id="commit-body",
                     )
@@ -1112,7 +1173,8 @@ class CommitComposerScreen(ModalScreen[None]):
                     "[bold cyan]Ctrl+P[/] post · "
                     "[bold cyan]Esc[/] cancel"
                     if self.mode != "quote"
-                    else "[bold cyan]Ctrl+V[/] nvim · [bold cyan]Ctrl+P[/] post · "
+                    else "[bold cyan]Ctrl+V[/] nvim · "
+                    "[bold cyan]Ctrl+P[/] post · "
                     "[bold cyan]Esc[/] cancel"
                 ),
                 id="composer-help",
@@ -1132,6 +1194,8 @@ class CommitComposerScreen(ModalScreen[None]):
                     disabled=True,
                 )
                 yield Button("Cancel", id="cancel-commit")
+        yield Static("", id="mention-status")
+        yield MentionSuggestionsList(id="mention-suggestions")
 
     def add_image(self, path: Path) -> str | None:
         if self.mode == "quote":
@@ -1172,7 +1236,8 @@ class CommitComposerScreen(ModalScreen[None]):
     def _show_composer_keybinds(self) -> None:
         if self.mode == "quote":
             self.query_one("#composer-help", Static).update(
-                "[bold cyan]Ctrl+V[/] nvim · [bold cyan]Ctrl+P[/] post · "
+                "[bold cyan]Ctrl+V[/] nvim · "
+                "[bold cyan]Ctrl+P[/] post · "
                 "[bold cyan]Esc[/] cancel"
             )
         else:
@@ -1224,6 +1289,153 @@ class CommitComposerScreen(ModalScreen[None]):
             self.query_one("#submit-commit", Button).disabled = not bool(
                 event.text_area.text.strip()
             )
+            self._update_mention_suggestions(event.text_area)
+
+    def on_text_area_selection_changed(self, event: TextArea.SelectionChanged) -> None:
+        if event.text_area.id == "commit-body":
+            self._update_mention_suggestions(event.text_area)
+
+    def _update_mention_suggestions(self, text_area: TextArea) -> None:
+        if not isinstance(text_area, MentionTextArea):
+            return
+        mention = text_area.mention_query()
+        query = mention[0] if mention is not None else ""
+        cursor = text_area.cursor_location
+        if query == self._active_mention_query:
+            if query and cursor != self._mention_anchor:
+                self._mention_anchor = cursor
+                self._schedule_mention_popover_position(text_area)
+            return
+
+        self._active_mention_query = query
+        self._mention_anchor = cursor if query else None
+        self._mention_search_generation += 1
+        suggestions = self.query_one("#mention-suggestions", MentionSuggestionsList)
+        status = self.query_one("#mention-status", Static)
+        suggestions.clear()
+        suggestions.display = False
+        status.display = False
+        if not query or self.search_users is None:
+            return
+
+        status.update("Searching users…")
+        status.display = True
+        self._schedule_mention_popover_position(text_area)
+        self.run_worker(
+            self._load_mention_suggestions(query, self._mention_search_generation),
+            group="mention-search",
+            exclusive=True,
+        )
+
+    async def _load_mention_suggestions(self, query: str, generation: int) -> None:
+        await asyncio.sleep(0.2)
+        if generation != self._mention_search_generation or not self.is_mounted:
+            return
+        search_users = self.search_users
+        if search_users is None:
+            return
+        try:
+            users = await asyncio.to_thread(search_users, query)
+        except ApiError as error:
+            if generation == self._mention_search_generation and self.is_mounted:
+                status = self.query_one("#mention-status", Static)
+                status.update(
+                    f"[bold red]Could not load mention suggestions: {escape(str(error))}[/bold red]"
+                )
+                status.display = True
+                self._schedule_mention_popover_position(
+                    self.query_one("#commit-body", MentionTextArea)
+                )
+        except OSError as error:
+            if generation == self._mention_search_generation and self.is_mounted:
+                status = self.query_one("#mention-status", Static)
+                status.update(
+                    f"[bold red]Could not load mention suggestions: {escape(str(error))}[/bold red]"
+                )
+                status.display = True
+                self._schedule_mention_popover_position(
+                    self.query_one("#commit-body", MentionTextArea)
+                )
+        else:
+            if generation != self._mention_search_generation or not self.is_mounted:
+                return
+            suggestions = self.query_one("#mention-suggestions", MentionSuggestionsList)
+            status = self.query_one("#mention-status", Static)
+            if users:
+                suggestions.extend(MentionSuggestionItem(user) for user in users)
+                suggestions.index = 0
+                suggestions.display = True
+                status.display = False
+                self._schedule_mention_popover_position(
+                    self.query_one("#commit-body", MentionTextArea),
+                )
+            else:
+                status.update("No matching users.")
+                status.display = True
+                self._schedule_mention_popover_position(
+                    self.query_one("#commit-body", MentionTextArea)
+                )
+
+    def _schedule_mention_popover_position(self, text_area: MentionTextArea) -> None:
+        generation = self._mention_search_generation
+        self.set_timer(
+            0.05,
+            lambda: self._position_mention_popover(text_area)
+            if self.is_mounted and generation == self._mention_search_generation
+            else None,
+        )
+
+    def _position_mention_popover(self, text_area: MentionTextArea) -> None:
+        if not self.is_mounted:
+            return
+
+        status = self.query_one("#mention-status", Static)
+        suggestions = self.query_one("#mention-suggestions", MentionSuggestionsList)
+        popup = suggestions if suggestions.display else status
+        if not popup.display:
+            return
+
+        cursor_x, cursor_y = text_area.cursor_screen_offset
+        content_region = self.content_region
+        content_right = content_region.x + content_region.width
+        content_bottom = content_region.y + content_region.height
+        x = min(max(cursor_x, content_region.x), max(content_right - 1, content_region.x))
+        width = max(min(42, content_right - x), 1)
+        popup.styles.width = width
+        popup_height = popup.region.height
+        if popup_height <= 0:
+            popup_height = (
+                min(len(suggestions.children) + 2, 8)
+                if popup is suggestions
+                else 1
+            )
+        y = cursor_y + 1
+        if y + popup_height > content_bottom:
+            y = cursor_y - popup_height
+        y = min(
+            max(y, content_region.y),
+            max(content_bottom - popup_height, content_region.y),
+        )
+        popup.styles.offset = (x - content_region.x, y - content_region.y)
+
+    def on_resize(self, event: Resize) -> None:
+        if self._active_mention_query:
+            self._schedule_mention_popover_position(
+                self.query_one("#commit-body", MentionTextArea),
+            )
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if not isinstance(event.list_view, MentionSuggestionsList):
+            return
+        if not isinstance(event.item, MentionSuggestionItem):
+            return
+        text_area = self.query_one("#commit-body", MentionTextArea)
+        if text_area.insert_mention(event.item.user.username):
+            self._active_mention_query = None
+            self._mention_anchor = None
+            self.query_one("#mention-suggestions", MentionSuggestionsList).display = False
+            self.query_one("#mention-status", Static).display = False
+            text_area.focus()
 
     async def action_edit_in_nvim(self) -> None:
         if self.query_one("#composer-mode", ContentSwitcher).current != "composer-form":
@@ -2144,7 +2356,6 @@ class DevNullApp(App[None]):
         self.notification_cursor: str | None = None
         self.notifications_version = 0
         self.notifications_loading = False
-
     def on_mount(self) -> None:
         self.set_interval(0.25, self._poll_callback_handoff)
         self.set_interval(0.5, self._check_omarchy_theme)
@@ -2699,7 +2910,17 @@ class DevNullApp(App[None]):
         else:
             mode = "new"
             context = None
-        self.push_screen(CommitComposerScreen(mode, context))
+        self.push_screen(
+            CommitComposerScreen(
+                mode,
+                context,
+                search_users=(
+                    self.api_client.search_users
+                    if self.api_client is not None
+                    else None
+                ),
+            )
+        )
 
     def _load_more_commit_replies(self) -> None:
         if isinstance(self.screen, CommitDetailScreen):
