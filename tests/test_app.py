@@ -1,32 +1,44 @@
 import base64
 import hashlib
 import json
+import os
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from PIL import Image as PILImage, ImageDraw
+from rich.cells import cell_len
+from rich.color import Color
 from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.events import MouseScrollDown
-from textual.widgets import ContentSwitcher, Label, Static, TextArea
+from textual.widgets import Button, ContentSwitcher, Input, Label, Static, TextArea
+from textual_image._terminal import get_cell_size
 
 from dev_null_tty import (
     CommitDetailScreen,
     CommitComposerScreen,
+    CommitImagePreview,
+    CommitImageViewer,
     DevNullApp,
     LinkedText,
     LinkedText,
     NotificationDetailScreen,
     _commit_display,
+    _image_crop_size,
     _linkify_urls,
+    _render_image_minimap,
 )
 from dev_null_tty.api import (
     ApiError,
     ApiCommit,
     ApiCommitContext,
     ApiCommitDetail,
+    ApiCommitImage,
+    ApiCommitPreview,
     ApiLog,
     ApiNotification,
     ApiNotifications,
@@ -234,6 +246,86 @@ async def test_r_refreshes_active_journal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_s_toggles_star_in_log_and_commit_thread() -> None:
+    initial_commit = ApiCommit(
+        "star-target",
+        "octocat",
+        "The Octocat",
+        "A commit to star.",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+        starred=False,
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.commit = initial_commit
+            self.star_requests: list[tuple[str, bool]] = []
+
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            return ApiLog((self.commit,), None, False, 0, ())
+
+        def get_commit_detail(self, commit_id):
+            return ApiCommitDetail(self.commit, ())
+
+        def get_replies(self, commit_id, cursor=None) -> ApiLog:
+            return ApiLog((), None, False, 0, ())
+
+        def set_commit_star(self, commit_id, starred) -> ApiCommit:
+            self.star_requests.append((commit_id, starred))
+            self.commit = ApiCommit(
+                self.commit.id,
+                self.commit.username,
+                self.commit.author_name,
+                self.commit.body,
+                self.commit.created_at,
+                self.commit.stars_count + (1 if starred else -1),
+                self.commit.replies_count,
+                starred=starred,
+            )
+            return self.commit
+
+    app = DevNullApp()
+    client = FakeClient()
+    app.api_client = client
+
+    async with app.run_test() as pilot:
+        app._show_log("latest")
+        for _ in range(20):
+            if app.log_loaded["latest"] and not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
+
+        journal = app.query_one("#latest-list")
+        journal.index = 0
+        journal.focus()
+        await pilot.press("s")
+        for _ in range(20):
+            if client.star_requests:
+                break
+            await pilot.pause(0.05)
+
+        assert client.star_requests == [("star-target", True)]
+        assert journal.children[0].commit.starred is True
+
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        await pilot.press("s")
+        for _ in range(20):
+            if len(client.star_requests) == 2:
+                break
+            await pilot.pause(0.05)
+
+        assert client.star_requests == [
+            ("star-target", True),
+            ("star-target", False),
+        ]
+        assert isinstance(app.screen, CommitDetailScreen)
+        assert app.screen.current_level.commit.starred is False
+
+
+@pytest.mark.asyncio
 async def test_notifications_view_loads_pages_and_opens_commit() -> None:
     notification_commit = ApiCommit(
         "notification-commit",
@@ -436,6 +528,252 @@ async def test_search_filters_commits() -> None:
         app.query_one("#search").value = "not present"
         await pilot.pause()
         assert not any(item.display for item in app.query("CommitCard"))
+
+
+@pytest.mark.asyncio
+async def test_commit_attachments_are_indicators_and_image_view_navigates() -> None:
+    image_file = BytesIO()
+    source_image = PILImage.new("RGB", (800, 600))
+    draw = ImageDraw.Draw(source_image)
+    for index in range(8):
+        draw.rectangle(
+            (index * 100, 0, index * 100 + 99, 599),
+            fill=(index * 32, 255 - index * 32, index * 16),
+        )
+    source_image.save(image_file, format="PNG")
+    images = (
+        ApiCommitImage(
+            "image-1",
+            "https://dev-null.sh/commit-images/image-1",
+            16,
+            8,
+            "First image",
+        ),
+        ApiCommitImage(
+            "image-2",
+            "https://dev-null.sh/commit-images/image-2",
+            16,
+            8,
+            "Second image",
+        ),
+    )
+    commit = ApiCommit(
+        "image-commit",
+        "octocat",
+        "The Octocat",
+        "A commit with a photo.",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+        images=images,
+    )
+    requested_images = []
+
+    class FakeClient:
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            return ApiLog((commit,), None, False, 0, ())
+
+        def get_commit_image(self, requested_image) -> bytes:
+            requested_images.append(requested_image.id)
+            return image_file.getvalue()
+
+        def get_commit_detail(self, commit_id) -> ApiCommitDetail:
+            return ApiCommitDetail(commit, ())
+
+        def get_replies(self, commit_id, cursor=None) -> ApiLog:
+            return ApiLog((), None, False, 0, ())
+
+    app = DevNullApp()
+    client = FakeClient()
+    app.api_client = client
+
+    async with app.run_test() as pilot:
+        app._show_log("latest")
+        for _ in range(20):
+            cards = app.query("#latest-list CommitCard")
+            if cards:
+                break
+            await pilot.pause(0.05)
+        assert cards
+        card = cards[0]
+        card_text = card.query_one(LinkedText).content
+        assert isinstance(card_text, Text)
+        assert "📎 2 images attached" in card_text.plain
+        assert not card.query(CommitImagePreview)
+
+        app.push_screen(CommitDetailScreen(commit, client))
+        await pilot.pause(0.1)
+        detail = app.screen
+        mode = detail.query_one("#thread-mode", ContentSwitcher)
+        assert mode.current == "thread-columns"
+        viewer = detail.query_one("#thread-image-view", CommitImageViewer)
+
+        await pilot.press("i")
+        assert mode.current == "thread-image-view"
+        for _ in range(20):
+            preview = viewer.query_one(CommitImagePreview)
+            if preview._loaded:
+                break
+            await pilot.pause(0.05)
+        assert preview._loaded
+        assert requested_images == ["image-1"]
+        assert preview.source_image.size == (800, 600)
+        assert "IMAGE 1 / 2" in viewer.query_one("#thread-image-caption", Label).render().plain
+        assert not viewer.query("#thread-image-help")
+        assert viewer.zoom_step == 0
+        terminal_image = preview.query_one(".terminal-image")
+        await pilot.pause(0.1)
+        original_pixels = terminal_image.image.tobytes()
+        original_widget_size = terminal_image.size
+        cell_size = get_cell_size()
+        frame_size = (original_widget_size.width, original_widget_size.height)
+        cell_pixels = (cell_size.width, cell_size.height)
+        frame_pixels = (
+            frame_size[0] * cell_pixels[0],
+            frame_size[1] * cell_pixels[1],
+        )
+        assert original_widget_size.width > 0
+        assert original_widget_size.height > 0
+        assert terminal_image.image.size == frame_pixels
+        assert terminal_image.image.getpixel((0, 0)) == (16, 20, 24)
+        assert terminal_image.image.getpixel(
+            (frame_pixels[0] // 2, frame_pixels[1] // 2)
+        ) != (16, 20, 24)
+        assert terminal_image.render() is not None
+        minimap = viewer.query_one("#thread-image-minimap", Static)
+        minimap_panel = viewer.query_one("#thread-image-map")
+        image_help = detail.query_one("#detail-help", Static)
+        assert not minimap_panel.display
+        image_stage = viewer.query_one("#thread-image-content")
+        detail_dialog = detail.query_one("#commit-detail-dialog")
+        assert "image-view-active" in detail_dialog.classes
+        assert image_help.display
+        assert "h / j / k / l pan" in image_help.render().plain
+        assert "Ctrl+N previous" in image_help.render().plain
+
+        await pilot.press("=")
+        assert viewer.zoom_step == 1
+        assert terminal_image.size == original_widget_size
+        assert terminal_image.image.size == frame_pixels
+        assert minimap_panel.display
+        assert preview.region.y == image_stage.region.y
+        assert preview.region.height == image_stage.region.height
+        assert preview.region == image_stage.region
+        assert terminal_image.region.width < preview.region.width
+        assert terminal_image.region.height < preview.region.height
+        assert terminal_image.region.x > preview.region.x
+        assert terminal_image.region.y > preview.region.y
+        assert detail_dialog.region.width == app.size.width
+        assert minimap_panel.region.x == image_stage.region.x
+        assert minimap_panel.region.y == image_stage.region.y
+        assert minimap.region.width == 15
+        assert minimap.region.height == 7
+        assert minimap.region.x + minimap.region.width <= (
+            minimap_panel.region.x + minimap_panel.region.width - 1
+        )
+        assert minimap.region.y + minimap.region.height <= (
+            minimap_panel.region.y + minimap_panel.region.height - 1
+        )
+        minimap_before_pan = minimap.render().plain
+        centered_zoom_pixels = terminal_image.image.tobytes()
+        assert centered_zoom_pixels != original_pixels
+        await pilot.press("l", "j")
+        assert viewer.pan_x > 0.5
+        assert viewer.pan_y > 0.5
+        assert minimap.render().plain != minimap_before_pan
+        assert terminal_image.image.tobytes() != centered_zoom_pixels
+        centered_minimap = _render_image_minimap(
+            source_image,
+            viewer.zoom_factor,
+            0.5,
+            0.5,
+            frame_size,
+            cell_pixels,
+        )
+        edge_red = Color.parse("#ff5c5c")
+        assert not any(span.style.color == edge_red for span in centered_minimap.spans)
+        await pilot.press("l", "j", "l", "j", "l", "j")
+        crop_width, crop_height = _image_crop_size(
+            source_image.size,
+            viewer.zoom_factor,
+            frame_size,
+            cell_pixels,
+        )
+        right_edge_pan = 1 - crop_width / (2 * 800) + round(crop_width * 0.1) / 800
+        bottom_edge_pan = 1 - crop_height / (2 * 600) + round(crop_height * 0.1) / 600
+        assert viewer.pan_x == pytest.approx(right_edge_pan)
+        assert viewer.pan_y == pytest.approx(bottom_edge_pan)
+        assert any(
+            span.style.color == edge_red
+            for span in _render_image_minimap(
+                source_image,
+                viewer.zoom_factor,
+                viewer.pan_x,
+                viewer.pan_y,
+                frame_size,
+                cell_pixels,
+            ).spans
+        )
+        edge_pixels = terminal_image.image.tobytes()
+        edge_minimap = minimap.render().plain
+        rendered_edge_minimap = _render_image_minimap(
+            source_image,
+            viewer.zoom_factor,
+            viewer.pan_x,
+            viewer.pan_y,
+            frame_size,
+            cell_pixels,
+        )
+        assert any(span.style.color == edge_red for span in rendered_edge_minimap.spans)
+        assert edge_minimap.count("┌") == 1
+        assert edge_minimap.count("┐") == 1
+        assert edge_minimap.count("└") == 1
+        assert edge_minimap.count("┘") == 1
+        assert edge_minimap.count("·") == 1
+        assert "▀" in edge_minimap
+        assert all(len(row) == 15 for row in edge_minimap.splitlines())
+        assert len(edge_minimap.splitlines()) == 7
+        await pilot.press("l", "j")
+        assert terminal_image.image.tobytes() == edge_pixels
+        assert minimap.render().plain == edge_minimap
+        await pilot.press("h", "k", "h", "k", "h", "k", "h", "k")
+        left_edge_pan = crop_width / (2 * 800) - round(crop_width * 0.1) / 800
+        top_edge_pan = crop_height / (2 * 600) - round(crop_height * 0.1) / 600
+        assert viewer.pan_x == pytest.approx(left_edge_pan)
+        assert viewer.pan_y == pytest.approx(top_edge_pan)
+        opposite_edge_pixels = terminal_image.image.tobytes()
+        opposite_edge_minimap = minimap.render().plain
+        await pilot.press("h", "k")
+        assert terminal_image.image.tobytes() == opposite_edge_pixels
+        assert minimap.render().plain == opposite_edge_minimap
+        await pilot.press("-")
+        assert viewer.zoom_step == 0
+        assert not minimap_panel.display
+        assert viewer.pan_x == 0.5
+        assert viewer.pan_y == 0.5
+        assert terminal_image.image.size == frame_pixels
+        assert terminal_image.image.tobytes() == original_pixels
+
+        await pilot.press("n")
+        for _ in range(20):
+            if preview._loaded and preview.image_info == images[1]:
+                break
+            await pilot.pause(0.05)
+        assert preview._loaded
+        assert preview.image_info == images[1]
+        assert requested_images == ["image-1", "image-2"]
+
+        await pilot.press("ctrl+n")
+        for _ in range(20):
+            if preview._loaded and preview.image_info == images[0]:
+                break
+            await pilot.pause(0.05)
+        assert preview._loaded
+        assert preview.image_info == images[0]
+
+        await pilot.press("i")
+        assert mode.current == "thread-columns"
+        assert "image-view-active" not in detail_dialog.classes
 
 
 @pytest.mark.asyncio
@@ -668,6 +1006,126 @@ async def test_user_can_submit_commits_and_replies() -> None:
 
 
 @pytest.mark.asyncio
+async def test_user_can_attach_images_to_a_new_commit(tmp_path, monkeypatch) -> None:
+    from contextlib import nullcontext
+
+    import dev_null_tty as dev_null_tty_module
+
+    image_path = tmp_path / "photo.png"
+    PILImage.new("RGB", (80, 40), (20, 40, 60)).save(image_path, format="PNG")
+    picked_image_path = tmp_path / "picked.jpg"
+    PILImage.new("RGB", (80, 40), (60, 40, 20)).save(picked_image_path, format="JPEG")
+    target = ApiCommit(
+        "existing",
+        "octocat",
+        "The Octocat",
+        "An existing commit",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+    )
+
+    class FakeClient:
+        image_submissions = []
+
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            return ApiLog((target,), None, False, 0, ())
+
+        def create_commit_with_images(
+            self,
+            body: str,
+            image_paths: tuple[Path, ...],
+            parent_id: str | None = None,
+        ) -> str:
+            self.image_submissions.append((body, image_paths, parent_id))
+            return "https://dev-null.sh/commits/created"
+
+    app = DevNullApp()
+    client = FakeClient()
+    selections = [(image_path,), (picked_image_path,)]
+    picker_calls = []
+
+    def fake_picker(max_images, *, candidates=None, prompt="Images> "):
+        picker_calls.append((max_images, candidates, prompt))
+        if candidates is not None:
+            return (image_path,)
+        return selections.pop(0)
+
+    monkeypatch.setattr(
+        dev_null_tty_module,
+        "_pick_images_with_fzf",
+        fake_picker,
+    )
+    monkeypatch.setattr(app, "suspend", nullcontext)
+    async with app.run_test() as pilot:
+        app._set_authenticated_user(client, ApiUser("octocat", "The Octocat", None, None))
+        app._show_log("latest")
+        await pilot.pause()
+        await pilot.press("C")
+        assert isinstance(app.screen, CommitComposerScreen)
+        assert not app.screen.query("#composer-image-path")
+        assert not app.screen.query("#add-image")
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        assert app.screen.image_paths == [image_path]
+        await pilot.click("#find-images")
+        await pilot.pause()
+        assert app.screen.image_paths == [image_path, picked_image_path], str(
+            app.screen.query_one("#composer-status", Static).render()
+        )
+
+        body = app.screen.query_one("#commit-body", TextArea)
+        action_buttons = app.screen.query("#composer-actions Button")
+        assert len(action_buttons) == 4
+        assert not app.screen.query("#preview-images")
+        assert len({button.region.y for button in action_buttons}) == 1
+        body.focus()
+        await pilot.press("i")
+        assert body.text == "i"
+        await pilot.press("ctrl+i")
+        mode = app.screen.query_one("#composer-mode", ContentSwitcher)
+        assert mode.current == "composer-image-view"
+        dialog = app.screen.query_one("#composer-dialog")
+        assert "image-view-active" in dialog.classes
+        assert dialog.region.width == app.size.width
+        assert dialog.region.height == app.size.height
+        assert not app.screen.query_one("#composer-actions").display
+        help_text = app.screen.query_one("#composer-help", Static).render()
+        assert "Ctrl+N" in help_text.plain
+        viewer = app.screen.query_one("#composer-image-view")
+        preview = viewer.query_one(CommitImagePreview)
+        for _ in range(20):
+            if preview._loaded:
+                break
+            await pilot.pause(0.05)
+        assert preview._loaded
+        assert preview.source_image.size == (80, 40)
+        await pilot.press("i")
+        assert mode.current == "composer-image-view"
+        await pilot.press("ctrl+i")
+        assert mode.current == "composer-form"
+        assert body.text == "i"
+
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        assert app.screen.image_paths == [picked_image_path]
+        assert picker_calls == [
+            (3, None, "Images> "),
+            (2, None, "Images> "),
+            (2, (image_path, picked_image_path), "Remove images> "),
+        ]
+
+        body.text = "A commit with a photo."
+        await pilot.press("ctrl+p")
+        await pilot.pause()
+
+        assert client.image_submissions == [
+            ("A commit with a photo.", (picked_image_path,), None)
+        ]
+        assert not isinstance(app.screen, CommitComposerScreen)
+
+
+@pytest.mark.asyncio
 async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
     original_body = "Full original commit. " + ("additional context " * 50)
     ancestor_body = "Ancestor context. " + ("previous comment " * 30)
@@ -701,6 +1159,18 @@ async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
         0,
         0,
     )
+    nested_replies = tuple(
+        ApiCommit(
+            f"nested-reply-{index}",
+            "octocat",
+            "The Octocat",
+            f"Nested reply {index}",
+            "2026-10-20T18:00:00Z",
+            0,
+            0,
+        )
+        for index in range(2)
+    )
 
     class FakeClient:
         def __init__(self) -> None:
@@ -726,6 +1196,8 @@ async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
 
         def get_replies(self, commit_id, cursor=None) -> ApiLog:
             self.reply_cursors.append((commit_id, cursor))
+            if commit_id == "reply-0":
+                return ApiLog(nested_replies, None, False, 0, ())
             if commit_id != "parent-id":
                 return ApiLog((), None, False, 0, ())
             if cursor is None:
@@ -759,11 +1231,24 @@ async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
         assert history.region.right <= replies.region.x
         current_pane = app.screen.query_one("#current-commit-pane")
         assert current_pane.region.y < replies.region.y
+        detail_dialog = app.screen.query_one("#commit-detail-dialog")
+        assert detail_dialog.region.width >= app.size.width * 0.94
+        assert detail_dialog.region.height >= app.size.height * 0.93
+        assert current_pane.max_scroll_y > 0
+        current_pane.scroll_to(
+            y=current_pane.max_scroll_y,
+            animate=False,
+            force=True,
+        )
+        await pilot.pause()
+        assert current_pane.scroll_y == current_pane.max_scroll_y
+        current_pane.scroll_y = 0
         assert len(app.screen.current_level.replies) == 12
         assert len(replies.children) == 12
         assert client.reply_cursors == [("parent-id", None)]
 
-        await pilot.press("j", "j", "k")
+        await pilot.press("j")
+        assert current_pane.scroll_y == 0
         assert replies.index == 0
         history.scroll_y = 0
         await pilot._post_mouse_events(
@@ -777,11 +1262,38 @@ async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
         assert history.scroll_y > 0
         await pilot.press("ctrl+k")
         assert history.scroll_y == 0
+        current_pane.scroll_y = 0
+        await pilot.press("alt+j")
+        await pilot.pause()
+        assert current_pane.scroll_y > 0
+        await pilot.press("alt+k")
+        await pilot.pause()
+        assert current_pane.scroll_y == 0
         replies.scroll_y = replies.max_scroll_y
         await pilot.pause(0.1)
         assert client.reply_cursors == [("parent-id", None), ("parent-id", "older")]
         assert len(replies.children) == 13
 
+        replies.index = 11
+        await pilot.pause()
+        selected_reply = replies.children[11]
+        replies.scroll_y += 1
+        await pilot.pause()
+        assert (
+            selected_reply.region.y < replies.content_region.y
+            or selected_reply.region.bottom > replies.content_region.bottom
+        )
+        reply_fits = selected_reply.region.height <= replies.content_region.height
+        await pilot.press("j")
+        await pilot.pause()
+        if reply_fits:
+            assert replies.index == 11
+            assert selected_reply.region.y >= replies.content_region.y
+            assert selected_reply.region.bottom <= replies.content_region.bottom
+            await pilot.press("j")
+        assert replies.index == 12
+
+        replies.index = 0
         await pilot.press("enter")
         await pilot.pause(0.1)
         assert len(app.screen.levels) == 2
@@ -792,6 +1304,11 @@ async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
         assert isinstance(current_commit, Text)
         assert original_body.strip() in thread_context.plain
         assert "Reply 0" in current_commit.plain
+        current_pane = app.screen.query_one("#current-commit-pane")
+        assert current_pane.max_scroll_y == 0
+        nested_replies_list = app.screen.query_one("#commit-replies")
+        await pilot.press("j", "j", "k")
+        assert nested_replies_list.index == 0
 
         await pilot.press("u")
         await pilot.pause()
@@ -932,6 +1449,120 @@ def test_commit_links_render_as_clickable_hyperlinks() -> None:
     ]
     assert links == ["https://example.com/docs", "https://dev-null.sh/"]
     assert rendered.plain.endswith(" (and https://dev-null.sh/).\n★ 0   ↩ 0")
+
+
+def test_commit_display_renders_quoted_commit_preview() -> None:
+    commit = SignedApiClient._commit_from_payload(
+        {
+            "id": "quote-post",
+            "author": {"username": "alice", "name": "Alice"},
+            "body": "A post with context.",
+            "created_at": "2026-10-20T18:00:00Z",
+            "quoted_commit_id": "original-post",
+            "quoted_commit": {
+                "id": "original-post",
+                "author": {"username": "bob", "name": "Bob"},
+                "body": "The original idea.",
+            },
+        }
+    )
+
+    assert commit.quoted_commit == ApiCommitPreview(
+        "original-post",
+        "bob",
+        "Bob",
+        "The original idea.",
+    )
+    rendered = _commit_display(commit, 600, show_counts=True)
+
+    assert "QUOTED COMMIT" in rendered.plain
+    assert "Bob @bob" in rendered.plain
+    assert "The original idea." in rendered.plain
+
+    thread_rendered = _commit_display(
+        commit,
+        600,
+        show_counts=True,
+        thread_view=True,
+    )
+    thread_header = thread_rendered.plain.splitlines()[0]
+    assert thread_header.startswith("Alice @alice · ")
+    assert thread_header.endswith(" · quoted reply")
+    assert "QUOTED COMMIT" not in thread_rendered.plain
+    assert "The original idea." not in thread_rendered.plain
+
+    replying_to_rendered = _commit_display(
+        commit,
+        600,
+        show_counts=True,
+        thread_view=True,
+        include_quote_text=True,
+    )
+    assert "Alice @alice · " in replying_to_rendered.plain
+    assert " · quoted reply" in replying_to_rendered.plain
+    assert "Bob @bob: “The original idea.”" in replying_to_rendered.plain
+    assert "QUOTED COMMIT" not in replying_to_rendered.plain
+
+
+def test_commit_display_marks_deleted_and_unavailable_quote_targets() -> None:
+    deleted_commit = SignedApiClient._commit_from_payload(
+        {
+            "id": "quote-post",
+            "author": {"username": "alice"},
+            "body": "A post with a deleted quote.",
+            "created_at": "2026-10-20T18:00:00Z",
+            "quoted_commit_id": "deleted-post",
+            "quoted_commit": {
+                "id": "deleted-post",
+                "deleted_at": "2026-10-20T17:00:00Z",
+            },
+        }
+    )
+    unavailable_commit = SignedApiClient._commit_from_payload(
+        {
+            "id": "quote-post",
+            "author": {"username": "alice"},
+            "body": "A post with an unavailable quote.",
+            "created_at": "2026-10-20T18:00:00Z",
+            "quoted_commit_id": "private-post",
+            "quoted_commit": None,
+        }
+    )
+
+    assert "This commit was deleted." in _commit_display(
+        deleted_commit, 600
+    ).plain
+    assert "Original commit is unavailable." in _commit_display(
+        unavailable_commit, 600
+    ).plain
+
+
+def test_quoted_commit_lines_wrap_to_available_width() -> None:
+    quote_text = "界" * 80 + " https://example.com/" + "long-segment" * 12
+    commit = ApiCommit(
+        "quote-post",
+        "alice",
+        "Alice",
+        "A short post.",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+        quoted_commit_id="original-post",
+        quoted_commit=ApiCommitPreview(
+            "original-post",
+            "bob",
+            "Bob",
+            quote_text,
+        ),
+    )
+
+    lines = _commit_display(commit, 600, width=24).plain.splitlines()
+    quote_start = next(index for index, line in enumerate(lines) if "QUOTED COMMIT" in line)
+    quote_lines = lines[quote_start:]
+
+    assert all(cell_len(line) <= 24 for line in quote_lines)
+    assert any("long-segment" in line for line in quote_lines)
+    assert quote_lines[-1].startswith("╰")
 
 
 @pytest.mark.asyncio
@@ -1354,6 +1985,15 @@ def test_get_log_sends_cursor_and_parses_journal(monkeypatch, tmp_path) -> None:
                             "created_at": "2026-10-20T18:00:00Z",
                             "stars_count": 7,
                             "replies_count": 2,
+                            "images": [
+                                {
+                                    "id": "image-id",
+                                    "url": "https://dev-null.sh/commit-images/image-id",
+                                    "width": 640,
+                                    "height": 480,
+                                    "description": "A photo",
+                                }
+                            ],
                             "author": {
                                 "username": "octocat",
                                 "name": "The Octocat",
@@ -1396,7 +2036,70 @@ def test_get_log_sends_cursor_and_parses_journal(monkeypatch, tmp_path) -> None:
         "2026-10-20T18:00:00Z",
         7,
         2,
+        images=(
+            ApiCommitImage(
+                "image-id",
+                "https://dev-null.sh/commit-images/image-id",
+                640,
+                480,
+                "A photo",
+            ),
+        ),
     )
+
+
+def test_get_commit_image_downloads_only_from_the_api_origin(tmp_path) -> None:
+    class Headers:
+        def get_content_type(self) -> str:
+            return "image/webp"
+
+    class Response:
+        headers = Headers()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            pass
+
+        def geturl(self) -> str:
+            return "https://dev-null.sh/commit-images/image-id"
+
+        def read(self, size: int) -> bytes:
+            assert size == 10_240_001
+            return b"webp-bytes"
+
+    class Opener:
+        request = None
+
+        def open(self, request, timeout: int) -> Response:
+            self.request = request
+            assert timeout == 20
+            return Response()
+
+    client = SignedApiClient(tmp_path / "device-key")
+    opener = Opener()
+    client._opener = opener
+    image = ApiCommitImage(
+        "image-id",
+        "https://dev-null.sh/commit-images/image-id",
+        640,
+        480,
+        None,
+    )
+
+    assert client.get_commit_image(image) == b"webp-bytes"
+    assert opener.request.full_url == image.url
+
+    image = ApiCommitImage(
+        "image-id",
+        "https://example.com/image.webp",
+        640,
+        480,
+        None,
+    )
+    with pytest.raises(ApiError, match="unexpected origin"):
+        client.get_commit_image(image)
 
 
 def test_get_replies_sends_signed_cursor_and_parses_replies(monkeypatch, tmp_path) -> None:
@@ -1681,6 +2384,65 @@ def test_get_commit_detail_parses_ancestors_and_tombstones(monkeypatch, tmp_path
     )
 
 
+def test_set_commit_star_posts_or_deletes_signed_request(monkeypatch, tmp_path) -> None:
+    import dev_null_tty.api as api
+
+    signed = []
+    monkeypatch.setattr(
+        api,
+        "signed_headers",
+        lambda method, path, body, key_path: signed.append((method, path, body)) or {},
+    )
+
+    class Response:
+        def __init__(self, request) -> None:
+            self.request = request
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            pass
+
+        def geturl(self) -> str:
+            return self.request.full_url
+
+        def read(self) -> bytes:
+            starred = self.request.get_method() == "POST"
+            return json.dumps(
+                {
+                    "data": {
+                        "id": "star-target",
+                        "body": "A commit to star.",
+                        "created_at": "2026-10-20T18:00:00Z",
+                        "stars_count": int(starred),
+                        "replies_count": 0,
+                        "starred": starred,
+                        "author": {"username": "octocat", "name": "The Octocat"},
+                    }
+                }
+            ).encode("utf-8")
+
+    class Opener:
+        def open(self, request, timeout: int) -> Response:
+            return Response(request)
+
+    client = SignedApiClient(tmp_path / "id_ed25519")
+    client._opener = Opener()
+
+    starred_commit = client.set_commit_star("star-target", True)
+    unstarred_commit = client.set_commit_star("star-target", False)
+
+    assert signed == [
+        ("POST", "/api/v1/commits/star-target/star", b""),
+        ("DELETE", "/api/v1/commits/star-target/star", b""),
+    ]
+    assert starred_commit.starred is True
+    assert starred_commit.stars_count == 1
+    assert unstarred_commit.starred is False
+    assert unstarred_commit.stars_count == 0
+
+
 def test_create_commit_posts_signed_replies_and_quotes(monkeypatch, tmp_path) -> None:
     import dev_null_tty.api as api
 
@@ -1753,6 +2515,274 @@ def test_create_commit_posts_signed_replies_and_quotes(monkeypatch, tmp_path) ->
     }
     assert opener.request.get_header("Content-type") == "application/json"
     assert reply.id == quote.id == "reply-id"
+
+
+def test_read_commit_images_validates_formats_and_size(monkeypatch, tmp_path) -> None:
+    import dev_null_tty.api as api
+
+    image_paths = (
+        tmp_path / "photo.jpg",
+        tmp_path / "photo.png",
+        tmp_path / "photo.webp",
+    )
+    image_paths[0].write_bytes(b"\xff\xd8\xffjpeg")
+    image_paths[1].write_bytes(b"\x89PNG\r\n\x1a\npng")
+    image_paths[2].write_bytes(b"RIFFxxxxWEBPwebp")
+
+    images = SignedApiClient._read_commit_images(image_paths)
+
+    assert [image[1:] for image in images] == [
+        ("image/jpeg", "jpg"),
+        ("image/png", "png"),
+        ("image/webp", "webp"),
+    ]
+
+    invalid_image = tmp_path / "invalid.gif"
+    invalid_image.write_bytes(b"GIF89a")
+    with pytest.raises(ApiError, match="JPEG, PNG, or WebP"):
+        SignedApiClient._read_commit_images((invalid_image,))
+
+    oversized_image = tmp_path / "oversized.png"
+    oversized_image.write_bytes(b"\x89PNG\r\n\x1a\nx")
+    monkeypatch.setattr(api, "MAX_COMMIT_IMAGE_BYTES", 8)
+    with pytest.raises(ApiError, match="larger than 10 MB"):
+        SignedApiClient._read_commit_images((oversized_image,))
+
+
+def test_fzf_image_picker_streams_supported_files_and_limits_selection(
+    monkeypatch, tmp_path
+) -> None:
+    import dev_null_tty as dev_null_tty_module
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(
+        dev_null_tty_module.Path,
+        "home",
+        classmethod(lambda cls: home),
+    )
+    monkeypatch.setenv("KITTY_WINDOW_ID", "7")
+    monkeypatch.setattr(
+        dev_null_tty_module.shutil,
+        "which",
+        lambda command: {
+            "find": "/usr/bin/find",
+            "fzf": "/usr/bin/fzf",
+        }.get(command),
+    )
+    processes = []
+    finder_outputs = []
+
+    class FakeFinder:
+        def __init__(self, arguments, **kwargs) -> None:
+            self.arguments = arguments
+            self.stdout = BytesIO()
+            self.returncode = 0
+            processes.append((self, kwargs))
+
+        def wait(self) -> int:
+            return self.returncode
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+    monkeypatch.setattr(dev_null_tty_module.subprocess, "Popen", FakeFinder)
+    selected_path = home / "photos" / "holiday.webp"
+
+    def fake_run(arguments, **kwargs):
+        processes.append((arguments, kwargs))
+        finder_outputs.append(kwargs.get("stdin", kwargs.get("input")))
+        return type(
+            "FzfResult",
+            (),
+            {
+                "returncode": 0,
+                "stdout": os.fsencode(selected_path) + b"\0",
+                "stderr": b"",
+            },
+        )()
+
+    monkeypatch.setattr(dev_null_tty_module.subprocess, "run", fake_run)
+
+    selected = dev_null_tty_module._pick_images_with_fzf(2)
+
+    assert selected == (selected_path,)
+    finder, finder_kwargs = processes[0]
+    assert finder.arguments == [
+        "/usr/bin/find",
+        str(home),
+        "-type",
+        "f",
+        "(",
+        "-iname",
+        "*.jpg",
+        "-o",
+        "-iname",
+        "*.jpeg",
+        "-o",
+        "-iname",
+        "*.png",
+        "-o",
+        "-iname",
+        "*.webp",
+        ")",
+        "-print0",
+    ]
+    assert finder_kwargs["stdout"] == dev_null_tty_module.subprocess.PIPE
+    assert finder_outputs == [finder.stdout]
+    arguments, kwargs = processes[1]
+    assert arguments == [
+        "/usr/bin/fzf",
+        "--read0",
+        "--print0",
+        "--multi=2",
+        "--prompt=Images> ",
+        "--layout=reverse",
+        "--border",
+        "--preview",
+        (
+            f"{dev_null_tty_module.shlex.quote(dev_null_tty_module.sys.executable)} "
+            "-m dev_null_tty.image_preview --image-id "
+            f"{dev_null_tty_module._IMAGE_PREVIEW_ID} {{}}"
+        ),
+        "--preview-window=right,50%,border-left",
+    ]
+    assert kwargs["stdin"] is finder.stdout
+    assert "--height=80%" not in arguments
+
+    removal_selection = dev_null_tty_module._pick_images_with_fzf(
+        2,
+        candidates=(selected_path,),
+        prompt="Remove images> ",
+    )
+
+    assert removal_selection == (selected_path,)
+    removal_arguments, removal_kwargs = processes[2]
+    assert removal_arguments[:7] == [
+        "/usr/bin/fzf",
+        "--read0",
+        "--print0",
+        "--multi=1",
+        "--prompt=Remove images> ",
+        "--layout=reverse",
+        "--border",
+    ]
+    assert removal_arguments[7:] == arguments[7:]
+    assert removal_kwargs["input"] == os.fsencode(selected_path) + b"\0"
+
+
+def test_fzf_picker_reports_missing_dependency(monkeypatch) -> None:
+    import dev_null_tty as dev_null_tty_module
+
+    monkeypatch.setattr(
+        dev_null_tty_module.shutil,
+        "which",
+        lambda command: "/usr/bin/find" if command == "find" else None,
+    )
+
+    with pytest.raises(ApiError, match="Install fzf"):
+        dev_null_tty_module._pick_images_with_fzf(1)
+
+
+def test_create_commit_with_images_signs_and_sends_multipart(monkeypatch, tmp_path) -> None:
+    import dev_null_tty.api as api
+
+    image_path = tmp_path / "photo.png"
+    image_bytes = b"\x89PNG\r\n\x1a\nimage-data"
+    image_path.write_bytes(image_bytes)
+    client = SignedApiClient(tmp_path / "device-key")
+    monkeypatch.setattr(
+        client,
+        "_lookup_cli_signing_key",
+        lambda: api._CliSigningKey("ssh-ed25519 dGVzdC1rZXk", None),
+    )
+    monkeypatch.setattr(api.shutil, "which", lambda name: "/usr/bin/ssh-keygen")
+    monkeypatch.setattr(api.time, "time", lambda: 1_700_000_000)
+    monkeypatch.setattr(api.secrets, "token_hex", lambda length: "a" * (length * 2))
+
+    signed_payloads = []
+
+    def fake_sign(args, **kwargs) -> None:
+        payload_path = Path(args[-1])
+        signed_payloads.append(payload_path.read_bytes())
+        Path(f"{payload_path}.sig").write_text(
+            "-----BEGIN SSH SIGNATURE-----\nc2ln\n-----END SSH SIGNATURE-----\n",
+            encoding="ascii",
+        )
+
+    monkeypatch.setattr(api.subprocess, "run", fake_sign)
+    requests = []
+
+    def fake_cli_request(path, body, headers, *, timeout) -> bytes:
+        requests.append((path, body, headers, timeout))
+        return b"https://dev-null.sh/commits/created"
+
+    monkeypatch.setattr(client, "_cli_request", fake_cli_request)
+
+    result = client.create_commit_with_images(
+        "A caption.",
+        (image_path,),
+        parent_id="reply-parent",
+    )
+
+    expected_payload = (
+        f"1700000000\n{'a' * 32}\nreply-parent\n"
+        f"{hashlib.sha256(image_bytes).hexdigest()}\nA caption."
+    ).encode()
+    assert result == "https://dev-null.sh/commits/created"
+    assert signed_payloads == [expected_payload]
+    path, multipart_body, headers, timeout = requests[0]
+    assert path == "/api/cli/commits"
+    assert timeout == 600
+    assert headers["X-SSH-Signature"] == "c2ln"
+    assert expected_payload in multipart_body
+    assert b'name="images[]"; filename="image-1.png"' in multipart_body
+    assert b"Content-Type: image/png" in multipart_body
+    assert image_bytes in multipart_body
+
+
+def test_cli_signing_key_lookup_uses_registered_ssh_agent_key(monkeypatch, tmp_path) -> None:
+    import dev_null_tty.api as api
+
+    public_key = "ssh-ed25519 dGVzdGtleQ=="
+    monkeypatch.setattr(api.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(api.shutil, "which", lambda name: "/usr/bin/ssh-add")
+    monkeypatch.setattr(
+        api.subprocess,
+        "run",
+        lambda *args, **kwargs: type(
+            "AgentResult",
+            (),
+            {"returncode": 0, "stdout": f"{public_key} agent-comment\n"},
+        )(),
+    )
+    client = SignedApiClient(tmp_path / "device-key")
+    requests = []
+
+    def fake_cli_request(path, body, headers, *, timeout) -> bytes:
+        requests.append((path, body, headers, timeout))
+        return f"{public_key} server-comment\n".encode()
+
+    monkeypatch.setattr(client, "_cli_request", fake_cli_request)
+
+    selected_key = client._lookup_cli_signing_key()
+
+    assert selected_key == api._CliSigningKey(public_key, None)
+    assert requests == [
+        (
+            "/api/cli/key-lookups",
+            f"{public_key}\n".encode("ascii"),
+            {
+                "Accept": "text/plain",
+                "Content-Type": "text/plain; charset=utf-8",
+                "User-Agent": "dev-null-tty",
+            },
+            30,
+        )
+    ]
 
 
 @pytest.mark.asyncio

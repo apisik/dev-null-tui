@@ -15,13 +15,52 @@ HTTP(S) links with the mouse to open them in your default browser. The modal
 composer shows the original commit above the editor for replies and quotes,
 and submits through the signed `POST /api/v1/commits` endpoint. Press
 `Ctrl+P` to submit. Press `Ctrl+Q` or `Escape` to close the composer.
+New commits and replies can include up to three JPEG, PNG, or WebP images
+(maximum 10 MB each). Press `Ctrl+F` or select **Find images** to open `fzf`
+with image files under your home directory. Type to filter, use `Up` / `Down`
+to move, `Tab` to select multiple images, and `Enter` to attach them, up to the
+three-image limit. Press `Escape` to cancel. The picker uses a full-screen
+terminal view and returns to the composer when it closes; `fzf` and `find` must
+be installed. Kitty/Ghostty terminals also show an image preview in the picker.
+Press `Ctrl+R` or select **Remove images** to open a preview-enabled `fzf`
+picker of the attached images. Select one or more and press `Enter` to detach
+them; this does not delete the image files. Image previews use
+Kitty's graphics protocol and work in Kitty or Ghostty without an external
+image-rendering command.
+Image uploads use the `/dev/null` CLI signing protocol and require a matching
+GitHub-registered SSH key available through
+`ssh-agent` or as a private key under `~/.ssh/`. Quotes continue to use the
+signed mobile API and do not support image attachments. Journal cards and
+thread commits show a paperclip and attachment count. Journal cards show quoted
+commits as compact, bordered context cards. In a commit thread, quoted replies
+are labeled beside the commenter's name; the replying-to pane also shows the
+quoted author's name and text inline. Quoted text wraps to the available width,
+and deleted or unavailable targets are labeled where previews are shown. In a
+commit thread, press `i` to open
+the current commit's expanded image view. A minimap overlay appears
+in the upper-left corner. The full image initially fits inside the available
+view frame without stretching; zooming moves a frame-sized viewport over it.
+Use `n` / `Ctrl+N` to move to
+the next / previous image, `=` / `-` to zoom in / out, and `h` / `j` / `k` / `l`
+to pan while zoomed. A compact square minimap appears while zoomed, showing the
+view position as a dot; the image edge turns red when you reach it. Panning
+allows a small buffer beyond the image edges, and the image-view keybinds remain
+visible while viewing.
+Press `i` again to return to the thread. Images use the
+terminal's supported graphics protocol or a colored-character fallback.
+In the composer, press `Ctrl+I` to open the full-screen viewer for attached
+images. `Ctrl+I` is the only way to toggle the viewer from the composer. The
+highlighted help line shows the active image keybinds. The composer action
+buttons share one row at the bottom.
 Press `Enter` on a selected journal entry to open its full commit and replies.
-Use `j` / `k` to navigate replies, `Enter` to follow a reply into its own
-thread, `u` to move to the parent comment, and `q` or `Escape` to return to the
-previous screen. Commit details show the ancestor and parent-comment context
-in a scrollable pane on the left, and the comment being replied to above its
-replies on the right. Press `Ctrl+J` / `Ctrl+K` or use the mouse wheel to
-scroll the ancestor history. Press `Ctrl+R` to reply to the thread's main
+Use `j` / `k` to navigate replies; if the selected reply is partly obscured,
+they first scroll it fully into view. Press `Enter` to follow a reply into its
+own thread, `u` to move to the parent comment, and `q` or `Escape` to return to
+the previous screen. Commit details show the ancestor and parent-comment
+context in a scrollable pane on the left, and the comment being replied to
+above its replies on the right. Use `Ctrl+J` / `Ctrl+K` or the mouse wheel to
+scroll ancestor history. Use `Alt+J` / `Alt+K` to scroll the replying-to
+commit. Press `Ctrl+R` to reply to the thread's main
 commit or selected comment. Scroll the replies list to load older replies.
 
 The profile's **Sign in with GitHub** action starts the documented PKCE
@@ -72,15 +111,25 @@ Keyboard shortcuts:
 - `r` — Refresh the active journal
 - `n` — Open notifications
 - `j` / `k` — Next / previous commit or notification
+- `j` / `k` (commit thread) — Next / previous reply
 - `Enter` — Open the selected commit/notification or follow a selected reply
-- `Ctrl+J` / `Ctrl+K` — Scroll commit thread history
-- `Ctrl+R` — Reply to the thread's main commit or selected comment
+- `Ctrl+J` / `Ctrl+K` (commit thread) — Scroll ancestor history
+- `Alt+J` / `Alt+K` (commit thread) — Scroll the current commit up / down
+- `i` (commit thread) — Toggle the current commit's image view
+- `Ctrl+I` (composer) — Toggle the attached-image preview while editing
+- `n` / `Ctrl+N` (image view) — Next / previous attached image
+- `=` / `-` (image view) — Zoom in / out
+- `h` / `j` / `k` / `l` (zoomed image) — Pan left / down / up / right
+- `Ctrl+R` — Reply to the thread's main commit or selected comment; choose
+  attached images to remove in the composer
+- `s` — Toggle star on the selected commit or thread comment
 - `u` — Move up to the parent comment in a thread
 - `q` (commit thread) — Return to the previous screen
 - `Escape` — Return to the previous screen
 - `Shift+C` — New commit
 - `Shift+Q` — Quote selected commit
 - `Shift+R` — Reply to selected commit
+- `Ctrl+F` (composer) — Find and attach images with `fzf`
 - `Ctrl+P` — Submit the commit, reply, or quote
 - `q` — Quit
 
