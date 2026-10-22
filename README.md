@@ -6,15 +6,17 @@ with [Textual](https://textual.textualize.io/) and managed with
 
 The **Following**, **Latest**, and **Trending** journals load real commits from
 the signed `/api/v1/log/{log}` endpoint after sign-in. Each journal supports
-automatic cursor-based infinite scrolling and commit search. Guest users can
-view the profile and sign in; journals require an approved device. Signed-in
+automatic cursor-based infinite scrolling. Guest users can view the profile
+and sign in; journals require an approved device. Signed-in
 users can browse a cursor-paginated notifications inbox, publish commits,
 reply to a commit, or quote it. Opening the notifications inbox marks
 notifications read on /dev/null. Click detected
 HTTP(S) links with the mouse to open them in your default browser. The modal
 composer shows the original commit above the editor for replies and quotes,
 and submits through the signed `POST /api/v1/commits` endpoint. Press
-`Ctrl+P` to submit. Press `Ctrl+Q` or `Escape` to close the composer.
+`Ctrl+P` to submit. Press `Ctrl+V` in the composer to edit the draft in Neovim;
+the text returns to the composer when Neovim exits successfully. Press `Ctrl+Q`
+or `Escape` to close the composer.
 New commits and replies can include up to three JPEG, PNG, or WebP images
 (maximum 10 MB each). Press `Ctrl+F` or select **Find images** to open `fzf`
 with image files under your home directory. Type to filter, use `Up` / `Down`
@@ -105,6 +107,13 @@ remains available if registration is unavailable.
 uv run dev-null-tty
 ```
 
+On Omarchy, the app reads the active palette from
+`~/.local/state/omarchy/current/theme/colors.toml` at startup and checks for
+changes while running, applying updates within about half a second. If that
+file is not present, it uses the terminal's ANSI palette. An unreadable or
+invalid palette file is reported instead of silently falling back; an invalid
+live update leaves the current palette in place.
+
 Keyboard shortcuts:
 
 - `h` / `l` — Previous / next journal
@@ -130,12 +139,13 @@ Keyboard shortcuts:
 - `Shift+Q` — Quote selected commit
 - `Shift+R` — Reply to selected commit
 - `Ctrl+F` (composer) — Find and attach images with `fzf`
+- `Ctrl+V` (composer) — Edit the draft in Neovim
 - `Ctrl+P` — Submit the commit, reply, or quote
 - `q` — Quit
 
 Journal navigation wraps between Latest, Following, and Trending. Loaded
-journals remain visible when you switch away; a cached journal refreshes after
-you leave it selected for two seconds.
+journals remain visible when you switch away and refresh as soon as you return
+to them.
 
 ## Test
 

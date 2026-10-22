@@ -1,15 +1,15 @@
 Screen {
-    background: #101418;
-    color: #d7e0e8;
+    background: $background;
+    color: $foreground;
 }
 
 Header {
-    background: #151c22;
-    color: #8be9fd;
+    background: $dark-background;
+    color: $primary;
 }
 
 Footer {
-    background: #151c22;
+    background: $dark-background;
 }
 
 #app-body {
@@ -20,8 +20,8 @@ Footer {
     width: 27;
     min-width: 22;
     padding: 2 2;
-    background: #151c22;
-    border-right: solid #28343d;
+    background: $dark-background;
+    border-right: solid $muted;
 }
 
 #brand {
@@ -35,10 +35,10 @@ Footer {
 }
 
 #sidebar Button.active {
-    background: #123d4c;
-    color: #c8f3ff;
+    background: $selection;
+    color: $bright-foreground;
     text-style: bold;
-    border: round #8be9fd;
+    border: round $primary;
 }
 
 #sidebar-note {
@@ -59,15 +59,10 @@ Footer {
     width: 1fr;
     padding: 1 2;
     margin-right: 1;
-    color: #b8f1ff;
+    color: $primary;
     text-style: bold;
-    background: #19232b;
-    border: round #40505c;
-}
-
-#search {
-    width: 20;
-    border: round #40505c;
+    background: $darker-background;
+    border: round $muted;
 }
 
 CommitComposerScreen {
@@ -82,8 +77,13 @@ CommitComposerScreen {
     max-height: 90%;
     overflow-y: auto;
     padding: 1 2;
-    background: #151c22;
-    border: heavy #8be9fd;
+    background: $dark-background;
+    border: heavy $primary;
+}
+
+#composer-dialog.new-commit {
+    width: 90%;
+    height: 90%;
 }
 
 #composer-dialog.image-view-active,
@@ -108,7 +108,7 @@ CommitComposerScreen {
 #composer-title,
 #commit-detail-title {
     height: 3;
-    color: #b8f1ff;
+    color: $primary;
     text-style: bold;
 }
 
@@ -118,14 +118,24 @@ CommitComposerScreen {
     overflow-y: auto;
     padding: 1 2;
     margin: 1 0;
-    background: #101418;
-    border: round #40505c;
+    background: $darker-background;
+    border: round $muted;
 }
 
 #commit-body {
     height: 7;
     margin: 1 0;
-    border: round #40505c;
+    border: round $muted;
+}
+
+#composer-dialog.new-commit #commit-body {
+    height: 1fr;
+    min-height: 7;
+}
+
+#composer-dialog.new-commit #composer-images {
+    height: 3;
+    overflow-y: auto;
 }
 
 #composer-mode,
@@ -140,12 +150,12 @@ CommitComposerScreen {
 
 #composer-images-label {
     height: 1;
-    color: #91a0aa;
+    color: $muted;
 }
 
 #composer-images {
     height: auto;
-    color: #91a0aa;
+    color: $muted;
 }
 
 #composer-actions {
@@ -178,7 +188,7 @@ CommitComposerScreen {
     height: auto;
     min-height: 1;
     padding: 0 1;
-    color: #91a0aa;
+    color: $muted;
     text-align: center;
 }
 
@@ -186,7 +196,7 @@ CommitComposerScreen {
 #commit-detail-dialog.image-view-active #detail-help {
     margin-top: 0;
     padding: 0 1;
-    border-top: solid #40505c;
+    border-top: solid $muted;
 }
 
 CommitDetailScreen {
@@ -206,13 +216,13 @@ CommitDetailScreen {
     height: auto;
     max-height: 80%;
     padding: 1 2;
-    background: #151c22;
-    border: heavy #8be9fd;
+    background: $dark-background;
+    border: heavy $primary;
 }
 
 #notification-detail-title {
     height: 3;
-    color: #b8f1ff;
+    color: $primary;
     text-style: bold;
 }
 
@@ -221,14 +231,14 @@ CommitDetailScreen {
     max-height: 60%;
     overflow-y: auto;
     padding: 1 2;
-    background: #101418;
-    border: round #40505c;
+    background: $darker-background;
+    border: round $muted;
 }
 
 #notification-detail-help {
     height: auto;
     margin-top: 1;
-    color: #91a0aa;
+    color: $muted;
 }
 
 #commit-detail-dialog {
@@ -239,8 +249,8 @@ CommitDetailScreen {
     min-height: 14;
     max-height: 95%;
     padding: 1 2;
-    background: #151c22;
-    border: heavy #8be9fd;
+    background: $dark-background;
+    border: heavy $primary;
 }
 
 #thread-columns {
@@ -271,21 +281,21 @@ CommitDetailScreen {
     width: 19;
     height: 12;
     padding: 1;
-    background: #101418;
-    border: round #40505c;
+    background: $darker-background;
+    border: round $muted;
 }
 
 #thread-image-caption {
     width: 1fr;
     height: 2;
-    color: #b8f1ff;
+    color: $primary;
     text-style: bold;
     text-align: center;
 }
 
 #thread-image-minimap-title {
     height: 1;
-    color: #91a0aa;
+    color: $muted;
     text-style: bold;
 }
 
@@ -301,8 +311,8 @@ CommitDetailScreen {
     overflow-y: auto;
     padding: 1 2;
     margin-right: 1;
-    background: #101418;
-    border: round #40505c;
+    background: $dark-background;
+    border: round $muted;
 }
 
 #thread-replies-pane {
@@ -316,7 +326,7 @@ CommitDetailScreen {
 
 #current-commit-title {
     height: 1;
-    color: #b8f1ff;
+    color: $primary;
     text-style: bold;
 }
 
@@ -327,8 +337,8 @@ CommitDetailScreen {
     overflow-y: auto;
     padding: 0 1;
     margin-bottom: 1;
-    background: #101418;
-    border: round #40505c;
+    background: $dark-background;
+    border: round $muted;
 }
 
 #current-commit {
@@ -360,36 +370,36 @@ CommitDetailScreen {
 
 .commit-image-status {
     height: auto;
-    color: #91a0aa;
+    color: $muted;
 }
 
 #replies-title {
     height: 3;
-    color: #b8f1ff;
+    color: $primary;
     text-style: bold;
 }
 
 #replies-status {
     height: auto;
-    color: #91a0aa;
+    color: $muted;
 }
 
 #notifications-note {
     height: auto;
     margin-bottom: 1;
-    color: #91a0aa;
+    color: $muted;
 }
 
 #commit-replies {
     height: 1fr;
     min-height: 5;
-    border: round #28343d;
+    border: round $muted;
 }
 
 #detail-help {
     height: auto;
     margin-top: 1;
-    color: #91a0aa;
+    color: $muted;
 }
 
 #views {
@@ -399,7 +409,7 @@ CommitDetailScreen {
 #following-list, #latest-list, #trending-list, #notifications-list {
     background: transparent;
     scrollbar-size: 1 1;
-    border: round #28343d;
+    border: round $muted;
 }
 
 .commit-card {
@@ -412,19 +422,19 @@ CommitDetailScreen {
 
 ListItem {
     margin-bottom: 1;
-    background: #151c22;
-    border: round #28343d;
+    background: $dark-background;
+    border: round $muted;
 }
 
 ListItem:hover {
-    background: #1b252d;
-    border: round #8be9fd;
+    background: $lighter-background;
+    border: round $primary;
 }
 
 ListView > ListItem.-highlight {
-    color: #effaff;
-    background: #123d4c;
-    border: round #8be9fd;
+    color: $bright-foreground;
+    background: $selection;
+    border: round $primary;
     text-style: bold;
 }
 
@@ -435,15 +445,15 @@ ListView > ListItem.-highlight {
 #profile-card {
     padding: 2;
     margin-bottom: 1;
-    background: #151c22;
-    border: round #28343d;
+    background: $dark-background;
+    border: round $muted;
 }
 
 .log-status {
     height: auto;
     padding: 0 1;
     margin-bottom: 1;
-    color: #ff8a8a;
+    color: $bright-red;
 }
 
 #sign-in, #logout {

@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import tomllib
 import webbrowser
 from typing import Literal
 
@@ -31,6 +32,7 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.events import Click, Resize
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import (
     Button,
     ContentSwitcher,
@@ -67,6 +69,130 @@ from textual_image.widget import Image as TerminalImage
 ComposerMode = Literal["new", "reply", "quote"]
 _URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 _IMAGE_PREVIEW_ID = secrets.randbelow(0xFFFFFF) + 1
+_OMARCHY_THEME_COLOR_FIELDS = (
+    "accent",
+    "selection",
+    "muted",
+    "background",
+    "dark_background",
+    "darker_background",
+    "lighter_background",
+    "foreground",
+    "light_foreground",
+    "bright_foreground",
+    "red",
+    "yellow",
+    "orange",
+    "green",
+    "cyan",
+    "blue",
+    "magenta",
+    "bright_red",
+    "bright_yellow",
+    "bright_green",
+    "bright_cyan",
+    "bright_blue",
+    "bright_magenta",
+)
+
+
+def _omarchy_colors_path() -> Path:
+    return Path.home() / ".local/state/omarchy/current/theme/colors.toml"
+
+
+def _omarchy_theme_file_signature(
+    colors_path: Path,
+) -> tuple[int, int, int, int] | None:
+    try:
+        stat = colors_path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RuntimeError(
+            f"Could not inspect Omarchy theme colors at {colors_path}: {error}"
+        ) from error
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
+def _load_omarchy_theme(colors_path: Path | None = None) -> Theme | None:
+    path = colors_path or _omarchy_colors_path()
+    try:
+        values = tomllib.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RuntimeError(f"Could not read Omarchy theme colors from {path}: {error}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise ValueError(f"Invalid Omarchy theme colors in {path}: {error}") from error
+
+    colors: dict[str, str] = {}
+    for name in _OMARCHY_THEME_COLOR_FIELDS:
+        value = values.get(name)
+        if not isinstance(value, str) or re.fullmatch(r"#[0-9a-fA-F]{6}", value) is None:
+            raise ValueError(f"Invalid or missing Omarchy color {name!r} in {path}.")
+        colors[name] = value
+
+    return Theme(
+        name="omarchy",
+        primary=colors["accent"],
+        secondary=colors["blue"],
+        warning=colors["yellow"],
+        error=colors["red"],
+        success=colors["green"],
+        accent=colors["orange"],
+        foreground=colors["foreground"],
+        background=colors["background"],
+        surface=colors["dark_background"],
+        panel=colors["lighter_background"],
+        boost=colors["selection"],
+        dark=values.get("mode", "dark") != "light",
+        variables={name.replace("_", "-"): color for name, color in colors.items()},
+    )
+
+
+def _terminal_ansi_theme() -> Theme:
+    variables = {
+        "ansi-background": "ansi_black",
+        "ansi-foreground": "ansi_white",
+        "selection": "ansi_blue",
+        "muted": "ansi_bright_black",
+        "dark-background": "ansi_default",
+        "darker-background": "ansi_default",
+        "lighter-background": "ansi_default",
+        "light-foreground": "ansi_default",
+        "bright-foreground": "ansi_bright_white",
+        "bright-red": "ansi_bright_red",
+        "bright-yellow": "ansi_bright_yellow",
+        "bright-green": "ansi_bright_green",
+        "bright-cyan": "ansi_bright_cyan",
+        "bright-blue": "ansi_bright_blue",
+        "bright-magenta": "ansi_bright_magenta",
+        "orange": "ansi_yellow",
+        "brown": "ansi_bright_black",
+    }
+    variables.update(
+        {
+            color: f"ansi_{color}"
+            for color in ("red", "yellow", "green", "cyan", "blue", "magenta")
+        }
+    )
+    return Theme(
+        name="terminal-ansi",
+        primary="ansi_cyan",
+        secondary="ansi_blue",
+        warning="ansi_yellow",
+        error="ansi_red",
+        success="ansi_green",
+        accent="ansi_cyan",
+        foreground="ansi_default",
+        background="ansi_default",
+        surface="ansi_default",
+        panel="ansi_default",
+        boost="ansi_blue",
+        dark=True,
+        variables=variables,
+        ansi=True,
+    )
 
 
 def _pick_images_with_fzf(
@@ -210,7 +336,7 @@ def _linkify_urls(content: str) -> Text:
             continue
         link_end = match.start() + len(url)
         rendered.append(content[position : match.start()])
-        rendered.append(url, style=Style(link=url, color="#8be9fd", underline=True))
+        rendered.append(url, style=Style(link=url, color="cyan", underline=True))
         position = link_end
     rendered.append(content[position:])
     return rendered
@@ -329,6 +455,8 @@ def _render_image_minimap(
     pan_y: float,
     frame_size: tuple[int, int],
     cell_size: tuple[int, int],
+    *,
+    edge_color: str = "#ff5c5c",
 ) -> Text:
     columns, rows = 15, 7
     pixel_rows = rows * 2
@@ -365,43 +493,50 @@ def _render_image_minimap(
             if 0 <= pixel_x < map_width and 0 <= top_y < map_height:
                 top_color = thumbnail.getpixel((pixel_x, top_y))
             else:
-                top_color = (16, 20, 24)
+                top_color = None
             if 0 <= pixel_x < map_width and 0 <= bottom_y < map_height:
                 bottom_color = thumbnail.getpixel((pixel_x, bottom_y))
             else:
-                bottom_color = (16, 20, 24)
-            image_background = f"#{bottom_color[0]:02x}{bottom_color[1]:02x}{bottom_color[2]:02x}"
+                bottom_color = None
+            image_background = (
+                "default"
+                if bottom_color is None
+                else f"#{bottom_color[0]:02x}{bottom_color[1]:02x}{bottom_color[2]:02x}"
+            )
             if x == dot_x and y == dot_y:
                 character = "·"
-                color = "#ffd166"
+                color = "yellow"
             elif x == box_x0 and y == box_y0:
                 character = "┌"
-                color = "#ff5c5c" if edge_left or edge_top else "#687781"
+                color = edge_color if edge_left or edge_top else "bright_black"
             elif x == box_x1 and y == box_y0:
                 character = "┐"
-                color = "#ff5c5c" if edge_right or edge_top else "#687781"
+                color = edge_color if edge_right or edge_top else "bright_black"
             elif x == box_x0 and y == box_y1:
                 character = "└"
-                color = "#ff5c5c" if edge_left or edge_bottom else "#687781"
+                color = edge_color if edge_left or edge_bottom else "bright_black"
             elif x == box_x1 and y == box_y1:
                 character = "┘"
-                color = "#ff5c5c" if edge_right or edge_bottom else "#687781"
+                color = edge_color if edge_right or edge_bottom else "bright_black"
             elif y == box_y0 and box_x0 <= x <= box_x1:
                 character = "─"
-                color = "#ff5c5c" if edge_top else "#687781"
+                color = edge_color if edge_top else "bright_black"
             elif y == box_y1 and box_x0 <= x <= box_x1:
                 character = "─"
-                color = "#ff5c5c" if edge_bottom else "#687781"
+                color = edge_color if edge_bottom else "bright_black"
             elif x == box_x0 and box_y0 <= y <= box_y1:
                 character = "│"
-                color = "#ff5c5c" if edge_left else "#687781"
+                color = edge_color if edge_left else "bright_black"
             elif x == box_x1 and box_y0 <= y <= box_y1:
                 character = "│"
-                color = "#ff5c5c" if edge_right else "#687781"
+                color = edge_color if edge_right else "bright_black"
             else:
-                character = "▀"
-                top_color_hex = f"#{top_color[0]:02x}{top_color[1]:02x}{top_color[2]:02x}"
-                color = top_color_hex
+                if top_color is None:
+                    character = " "
+                    color = "default"
+                else:
+                    character = "▀"
+                    color = f"#{top_color[0]:02x}{top_color[1]:02x}{top_color[2]:02x}"
             style = Style(color=color, bgcolor=image_background)
             minimap.append(character, style=style)
         if y < rows - 1:
@@ -725,6 +860,8 @@ class CommitImageViewer(Vertical):
         if show_minimap and source_image is not None:
             terminal_image = preview.query_one(TerminalImage)
             cell_size = get_cell_size()
+            edge_color = self.app.current_theme.error or "#ff5c5c"
+            edge_color = edge_color.removeprefix("ansi_")
             self.query_one("#thread-image-minimap", Static).update(
                 _render_image_minimap(
                     source_image,
@@ -733,6 +870,7 @@ class CommitImageViewer(Vertical):
                     self.pan_y,
                     (terminal_image.size.width, terminal_image.size.height),
                     (cell_size.width, cell_size.height),
+                    edge_color=edge_color,
                 )
             )
 
@@ -905,6 +1043,7 @@ class CommitComposerScreen(ModalScreen[None]):
     BINDINGS = [
         Binding("ctrl+f", "find_images", "Attach images", show=False, priority=True),
         Binding("ctrl+i", "toggle_image_view", "Preview images", show=False, priority=True),
+        Binding("ctrl+v", "edit_in_nvim", "Edit in Neovim", show=False, priority=True),
         Binding(
             "ctrl+r",
             "choose_images_to_remove",
@@ -936,7 +1075,10 @@ class CommitComposerScreen(ModalScreen[None]):
         else:
             title = "New commit"
 
-        with Container(id="composer-dialog"):
+        with Container(
+            id="composer-dialog",
+            classes="new-commit" if self.mode == "new" else "",
+        ):
             yield Label(title, id="composer-title")
             if self.commit is not None:
                 yield LinkedText(
@@ -966,10 +1108,12 @@ class CommitComposerScreen(ModalScreen[None]):
             yield Static(
                 (
                     "[bold cyan]Ctrl+F[/] attach · [bold cyan]Ctrl+R[/] remove · "
-                    "[bold cyan]Ctrl+I[/] preview · [bold cyan]Ctrl+P[/] post · "
+                    "[bold cyan]Ctrl+I[/] preview · [bold cyan]Ctrl+V[/] nvim · "
+                    "[bold cyan]Ctrl+P[/] post · "
                     "[bold cyan]Esc[/] cancel"
                     if self.mode != "quote"
-                    else "[bold cyan]Ctrl+P[/] post · [bold cyan]Esc[/] cancel"
+                    else "[bold cyan]Ctrl+V[/] nvim · [bold cyan]Ctrl+P[/] post · "
+                    "[bold cyan]Esc[/] cancel"
                 ),
                 id="composer-help",
             )
@@ -1028,12 +1172,14 @@ class CommitComposerScreen(ModalScreen[None]):
     def _show_composer_keybinds(self) -> None:
         if self.mode == "quote":
             self.query_one("#composer-help", Static).update(
-                "[bold cyan]Ctrl+P[/] post · [bold cyan]Esc[/] cancel"
+                "[bold cyan]Ctrl+V[/] nvim · [bold cyan]Ctrl+P[/] post · "
+                "[bold cyan]Esc[/] cancel"
             )
         else:
             self.query_one("#composer-help", Static).update(
                 "[bold cyan]Ctrl+F[/] attach · [bold cyan]Ctrl+R[/] remove · "
-                "[bold cyan]Ctrl+I[/] preview · [bold cyan]Ctrl+P[/] post · "
+                "[bold cyan]Ctrl+I[/] preview · [bold cyan]Ctrl+V[/] nvim · "
+                "[bold cyan]Ctrl+P[/] post · "
                 "[bold cyan]Esc[/] cancel"
             )
 
@@ -1078,6 +1224,45 @@ class CommitComposerScreen(ModalScreen[None]):
             self.query_one("#submit-commit", Button).disabled = not bool(
                 event.text_area.text.strip()
             )
+
+    async def action_edit_in_nvim(self) -> None:
+        if self.query_one("#composer-mode", ContentSwitcher).current != "composer-form":
+            return
+
+        text_area = self.query_one("#commit-body", TextArea)
+        status = self.query_one("#composer-status", Static)
+        editor = shutil.which("nvim")
+        if editor is None:
+            status.update("[bold red]Install Neovim to edit this draft.[/bold red]")
+            text_area.focus()
+            return
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="dev-null-tty-") as directory:
+                draft_path = Path(directory) / "commit.md"
+                draft_path.write_text(text_area.text, encoding="utf-8")
+                with self.app.suspend():
+                    result = subprocess.run(
+                        [editor, str(draft_path)],
+                        check=False,
+                    )
+                if result.returncode != 0:
+                    status.update(
+                        "[bold yellow]Neovim exited without saving the draft.[/bold yellow]"
+                    )
+                    return
+                draft = draft_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            status.update(
+                f"[bold red]Could not edit the draft with Neovim: "
+                f"{escape(str(error))}[/bold red]"
+            )
+            return
+        finally:
+            text_area.focus()
+
+        text_area.text = draft
+        status.update("")
 
     async def action_cancel(self) -> None:
         await self.app.pop_screen()
@@ -1923,6 +2108,14 @@ class DevNullApp(App[None]):
 
     def __init__(self) -> None:
         super().__init__()
+        self._omarchy_colors_path = _omarchy_colors_path()
+        theme = _load_omarchy_theme() or _terminal_ansi_theme()
+        self.register_theme(theme)
+        self.theme = theme.name
+        self._omarchy_theme_signature = _omarchy_theme_file_signature(
+            self._omarchy_colors_path
+        )
+        self._omarchy_theme_watch_error: str | None = None
         self.authenticated_user: ApiUser | None = None
         self.api_client: SignedApiClient | None = None
         self.pending_authorization: DeviceAuthorization | None = None
@@ -1937,7 +2130,6 @@ class DevNullApp(App[None]):
             "latest": False,
             "trending": False,
         }
-        self.log_refresh_generation = 0
         self.commit_star_toggles: set[str] = set()
         self.log_versions: dict[LogName, int] = {
             "following": 0,
@@ -1955,7 +2147,45 @@ class DevNullApp(App[None]):
 
     def on_mount(self) -> None:
         self.set_interval(0.25, self._poll_callback_handoff)
+        self.set_interval(0.5, self._check_omarchy_theme)
         self.run_worker(self._restore_saved_session(), group="session-restore", exclusive=True)
+
+    def _check_omarchy_theme(self) -> None:
+        try:
+            signature = _omarchy_theme_file_signature(self._omarchy_colors_path)
+        except RuntimeError as error:
+            message = str(error)
+            if message != self._omarchy_theme_watch_error:
+                self.notify(message, severity="warning")
+                self._omarchy_theme_watch_error = message
+            return
+
+        self._omarchy_theme_watch_error = None
+        if signature == self._omarchy_theme_signature:
+            return
+        self._omarchy_theme_signature = signature
+
+        try:
+            theme = (
+                _load_omarchy_theme(self._omarchy_colors_path)
+                or _terminal_ansi_theme()
+            )
+        except (RuntimeError, ValueError) as error:
+            self.notify(
+                f"Could not reload Omarchy color theme: {error}",
+                severity="error",
+            )
+            return
+
+        if theme == self.current_theme:
+            return
+
+        self.register_theme(theme)
+        if self.theme == theme.name:
+            self.refresh_css(animate=False)
+        else:
+            self.theme = theme.name
+        self.notify("Color theme updated.", severity="information")
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1964,7 +2194,6 @@ class DevNullApp(App[None]):
             with Vertical(id="main-column"):
                 with Container(id="toolbar"):
                     yield Label("LOG / LATEST", id="view-title")
-                    yield Input(placeholder="Search commits...", id="search")
                 with ContentSwitcher(initial="latest-view", id="views"):
                     yield self._log_view("latest")
                     yield self._log_view("following")
@@ -2101,7 +2330,6 @@ class DevNullApp(App[None]):
     def _show_view(self, view: str, title: str, active_button: str) -> None:
         self.query_one("#views", ContentSwitcher).current = view
         self.query_one("#view-title", Label).update(title)
-        self.query_one("#search", Input).display = view != "notifications-view"
         for button_id in (
             "latest-log",
             "following-log",
@@ -2117,41 +2345,17 @@ class DevNullApp(App[None]):
 
     def _show_log(self, log_name: LogName) -> None:
         self.active_log = log_name
-        self.log_refresh_generation += 1
-        refresh_generation = self.log_refresh_generation
         titles = {
             "following": "LOG / FOLLOWING",
             "latest": "LOG / LATEST",
             "trending": "LOG / TRENDING",
         }
         self._show_view(f"{log_name}-view", titles[log_name], f"{log_name}-log")
-        if self.log_loaded[log_name]:
-            self.run_worker(
-                self._refresh_log_after_idle(log_name, refresh_generation),
-                group="log-auto-refresh",
-                exclusive=True,
-            )
-        else:
-            self._start_log_load(log_name, reset=True)
-
-    async def _refresh_log_after_idle(
-        self,
-        log_name: LogName,
-        refresh_generation: int,
-    ) -> None:
-        await asyncio.sleep(2)
-        if (
-            self.is_running
-            and self.log_refresh_generation == refresh_generation
-            and self.active_log == log_name
-            and self.query_one("#views", ContentSwitcher).current == f"{log_name}-view"
-        ):
-            self._start_log_load(log_name, reset=True)
+        self._start_log_load(log_name, reset=True)
 
     def action_refresh_log(self) -> None:
         if self.query_one("#views", ContentSwitcher).current != f"{self.active_log}-view":
             return
-        self.log_refresh_generation += 1
         self._start_log_load(self.active_log, reset=True)
 
     def action_toggle_star_selected(self) -> None:
@@ -2773,18 +2977,6 @@ class DevNullApp(App[None]):
             status.update(f"[bold red]{escape(str(error))}[/bold red]")
             return
         await self._complete_sign_in(callback_url)
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id != "search":
-            return
-        query = event.value.casefold().strip()
-        for log_name in ("following", "latest", "trending"):
-            for item in self.query_one(f"#{log_name}-list", ListView).query(CommitCard):
-                item.display = not query or query in (
-                    f"{item.commit.author_name or item.commit.username} "
-                    f"@{item.commit.username} {item.commit.body}"
-                ).casefold()
-
 
 def main() -> None:
     """Run the TUI or handle a registered devnull:// callback."""

@@ -2,6 +2,8 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
+from contextlib import nullcontext
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -15,6 +17,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.events import MouseScrollDown
+from textual.theme import Theme
 from textual.widgets import Button, ContentSwitcher, Input, Label, Static, TextArea
 from textual_image._terminal import get_cell_size
 
@@ -30,7 +33,9 @@ from dev_null_tty import (
     _commit_display,
     _image_crop_size,
     _linkify_urls,
+    _load_omarchy_theme,
     _render_image_minimap,
+    _terminal_ansi_theme,
 )
 from dev_null_tty.api import (
     ApiError,
@@ -74,6 +79,204 @@ async def test_app_starts_on_latest_log() -> None:
         assert not app.query("#new-commit")
         assert not app.query("#reply-selected")
         assert not app.query("#quote-selected")
+        assert not app.query("#search")
+
+
+@pytest.mark.asyncio
+async def test_new_commit_composer_expands_and_reserves_image_rows() -> None:
+    app = DevNullApp()
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        app.push_screen(CommitComposerScreen("new"))
+        await pilot.pause()
+
+        dialog = app.screen.query_one("#composer-dialog")
+        text_area = app.screen.query_one("#commit-body", TextArea)
+        images = app.screen.query_one("#composer-images", Static)
+
+        assert "new-commit" in dialog.classes
+        assert dialog.region.height >= 36
+        assert text_area.region.height > 7
+        assert images.region.height == 3
+
+
+def test_load_omarchy_theme_reads_palette_colors(tmp_path) -> None:
+    colors = {
+        "accent": "#112233",
+        "selection": "#223344",
+        "muted": "#334455",
+        "background": "#445566",
+        "dark_background": "#556677",
+        "darker_background": "#667788",
+        "lighter_background": "#778899",
+        "foreground": "#8899aa",
+        "light_foreground": "#99aabb",
+        "bright_foreground": "#aabbcc",
+        "red": "#bbccdd",
+        "yellow": "#ccddee",
+        "orange": "#ddeeff",
+        "green": "#eeff00",
+        "cyan": "#ff0011",
+        "blue": "#001122",
+        "magenta": "#112244",
+        "bright_red": "#223355",
+        "bright_yellow": "#334466",
+        "bright_green": "#445577",
+        "bright_cyan": "#556688",
+        "bright_blue": "#667799",
+        "bright_magenta": "#7788aa",
+    }
+    colors_path = tmp_path / "colors.toml"
+    colors_path.write_text(
+        'mode = "light"\n'
+        + "\n".join(f'{name} = "{value}"' for name, value in colors.items()),
+        encoding="utf-8",
+    )
+
+    theme = _load_omarchy_theme(colors_path)
+
+    assert theme is not None
+    assert theme.name == "omarchy"
+    assert theme.primary == colors["accent"]
+    assert theme.foreground == colors["foreground"]
+    assert theme.background == colors["background"]
+    assert not theme.dark
+    assert theme.variables["selection"] == colors["selection"]
+    assert theme.variables["bright-foreground"] == colors["bright_foreground"]
+
+
+def test_missing_omarchy_palette_uses_terminal_ansi_theme(tmp_path) -> None:
+    assert _load_omarchy_theme(tmp_path / "missing-colors.toml") is None
+
+    theme = _terminal_ansi_theme()
+
+    assert theme.name == "terminal-ansi"
+    assert theme.ansi
+    assert theme.variables["selection"] == "ansi_blue"
+
+
+@pytest.mark.asyncio
+async def test_app_registers_and_uses_loaded_theme(monkeypatch) -> None:
+    theme = _terminal_ansi_theme()
+    theme.name = "test-palette"
+    monkeypatch.setattr(
+        "dev_null_tty._load_omarchy_theme",
+        lambda _colors_path=None: theme,
+    )
+
+    app = DevNullApp()
+
+    assert app.theme == "test-palette"
+    async with app.run_test():
+        assert app.theme == "test-palette"
+
+
+@pytest.mark.asyncio
+async def test_app_uses_terminal_theme_when_omarchy_palette_is_missing(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "dev_null_tty._load_omarchy_theme",
+        lambda _colors_path=None: None,
+    )
+
+    app = DevNullApp()
+
+    assert app.theme == "terminal-ansi"
+    async with app.run_test():
+        assert app.theme == "terminal-ansi"
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_edits_commit_draft_in_nvim(monkeypatch) -> None:
+    import dev_null_tty as dev_null_tty_module
+
+    app = DevNullApp()
+    monkeypatch.setattr(app, "suspend", nullcontext)
+    monkeypatch.setattr(dev_null_tty_module.shutil, "which", lambda name: "/usr/bin/nvim")
+    editor_files: list[Path] = []
+
+    def fake_run(command: list[str], *, check: bool) -> subprocess.CompletedProcess:
+        assert command[0] == "/usr/bin/nvim"
+        assert check is False
+        draft_path = Path(command[1])
+        editor_files.append(draft_path)
+        assert draft_path.read_text(encoding="utf-8") == "Existing draft"
+        draft_path.write_text("Edited in Neovim", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(dev_null_tty_module.subprocess, "run", fake_run)
+
+    async with app.run_test() as pilot:
+        app.push_screen(CommitComposerScreen("new"))
+        await pilot.pause()
+        text_area = app.screen.query_one("#commit-body", TextArea)
+        text_area.text = "Existing draft"
+        await pilot.pause()
+
+        await pilot.press("ctrl+v")
+        await pilot.pause()
+
+        assert text_area.text == "Edited in Neovim"
+        assert app.screen.query_one("#submit-commit").disabled is False
+        assert editor_files and not editor_files[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_reports_missing_nvim_without_changing_draft(monkeypatch) -> None:
+    import dev_null_tty as dev_null_tty_module
+
+    app = DevNullApp()
+    monkeypatch.setattr(dev_null_tty_module.shutil, "which", lambda name: None)
+
+    async with app.run_test() as pilot:
+        app.push_screen(CommitComposerScreen("new"))
+        await pilot.pause()
+        text_area = app.screen.query_one("#commit-body", TextArea)
+        text_area.text = "Keep this draft"
+        await pilot.pause()
+
+        await pilot.press("ctrl+v")
+
+        assert text_area.text == "Keep this draft"
+        assert "Install Neovim" in app.screen.query_one(
+            "#composer-status", Static
+        ).render().plain
+
+
+@pytest.mark.asyncio
+async def test_app_reloads_updated_omarchy_palette_without_restart(
+    monkeypatch, tmp_path
+) -> None:
+    colors_path = tmp_path / "colors.toml"
+    colors_path.write_text("initial-palette", encoding="utf-8")
+    monkeypatch.setattr("dev_null_tty._omarchy_colors_path", lambda: colors_path)
+
+    def palette(accent: str) -> Theme:
+        theme = _terminal_ansi_theme()
+        theme.name = "omarchy"
+        theme.primary = accent
+        return theme
+
+    themes = {
+        "initial-palette": palette("#123456"),
+        "updated-palette-from-omarchy": palette("#abcdef"),
+    }
+
+    def load_palette(path: Path | None = None) -> Theme:
+        return themes[(path or colors_path).read_text(encoding="utf-8")]
+
+    monkeypatch.setattr("dev_null_tty._load_omarchy_theme", load_palette)
+    app = DevNullApp()
+
+    assert app.current_theme.primary == "#123456"
+
+    async with app.run_test() as pilot:
+        colors_path.write_text("updated-palette-from-omarchy", encoding="utf-8")
+        await pilot.pause(0.75)
+
+        assert app.current_theme.primary == "#abcdef"
+        assert app.theme_variables["primary"] == "#ABCDEF"
 
 
 @pytest.mark.asyncio
@@ -141,7 +344,7 @@ async def test_journal_navigation_wraps_around() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cached_journals_refresh_only_after_selection_settles() -> None:
+async def test_cached_journals_refresh_immediately_when_reselected() -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str | None]] = []
@@ -182,18 +385,12 @@ async def test_cached_journals_refresh_only_after_selection_settles() -> None:
 
         app._show_log("latest")
         assert app.query_one("#latest-list").children[0].commit.id == "latest-1"
-        await pilot.pause(1.1)
-        assert sum(name == "latest" for name, _ in client.calls) == 1
+        await wait_for_load("latest", 2)
+        assert app.query_one("#latest-list").children[0].commit.id == "latest-2"
 
         app._show_log("following")
         assert app.query_one("#following-list").children[0].commit.id == "following-1"
-        await pilot.pause(1.1)
-        assert sum(name == "latest" for name, _ in client.calls) == 1
-        assert sum(name == "following" for name, _ in client.calls) == 1
-
-        await pilot.pause(1.1)
         await wait_for_load("following", 2)
-        assert sum(name == "latest" for name, _ in client.calls) == 1
         assert app.query_one("#following-list").children[0].commit.id == "following-2"
 
 
@@ -452,7 +649,6 @@ async def test_notifications_view_loads_pages_and_opens_commit() -> None:
 
         notification_list = app.query_one("#notifications-list")
         assert client.cursors == [None, "older"]
-        assert not app.query_one("#search").display
         assert len(notification_list.children) == 2
         rendered_notification = notification_list.children[0].query_one(LinkedText).content
         assert isinstance(rendered_notification, Text)
@@ -493,41 +689,6 @@ async def test_notifications_view_loads_pages_and_opens_commit() -> None:
         await pilot.press("q")
         await pilot.pause()
         assert not isinstance(app.screen, CommitDetailScreen)
-
-
-@pytest.mark.asyncio
-async def test_search_filters_commits() -> None:
-    app = DevNullApp()
-    async with app.run_test() as pilot:
-        class FakeClient:
-            def get_log(self, log_name, cursor=None) -> ApiLog:
-                return ApiLog(
-                    (
-                        ApiCommit(
-                            "commit-1",
-                            "octocat",
-                            "The Octocat",
-                            "Building in public.",
-                            "2026-10-20T18:00:00Z",
-                            12,
-                            3,
-                        ),
-                    ),
-                    None,
-                    False,
-                    0,
-                    (),
-                )
-
-        app.api_client = FakeClient()
-        app._show_log("latest")
-        await pilot.pause()
-        app.query_one("#search").value = "octocat"
-        await pilot.pause()
-        assert len([item for item in app.query("CommitCard") if item.display]) == 1
-        app.query_one("#search").value = "not present"
-        await pilot.pause()
-        assert not any(item.display for item in app.query("CommitCard"))
 
 
 @pytest.mark.asyncio
@@ -682,6 +843,7 @@ async def test_commit_attachments_are_indicators_and_image_view_navigates() -> N
         assert viewer.pan_y > 0.5
         assert minimap.render().plain != minimap_before_pan
         assert terminal_image.image.tobytes() != centered_zoom_pixels
+        edge_color = (app.current_theme.error or "#ff5c5c").removeprefix("ansi_")
         centered_minimap = _render_image_minimap(
             source_image,
             viewer.zoom_factor,
@@ -689,8 +851,9 @@ async def test_commit_attachments_are_indicators_and_image_view_navigates() -> N
             0.5,
             frame_size,
             cell_pixels,
+            edge_color=edge_color,
         )
-        edge_red = Color.parse("#ff5c5c")
+        edge_red = Color.parse(edge_color)
         assert not any(span.style.color == edge_red for span in centered_minimap.spans)
         await pilot.press("l", "j", "l", "j", "l", "j")
         crop_width, crop_height = _image_crop_size(
@@ -712,6 +875,7 @@ async def test_commit_attachments_are_indicators_and_image_view_navigates() -> N
                 viewer.pan_y,
                 frame_size,
                 cell_pixels,
+                edge_color=edge_color,
             ).spans
         )
         edge_pixels = terminal_image.image.tobytes()
@@ -723,6 +887,7 @@ async def test_commit_attachments_are_indicators_and_image_view_navigates() -> N
             viewer.pan_y,
             frame_size,
             cell_pixels,
+            edge_color=edge_color,
         )
         assert any(span.style.color == edge_red for span in rendered_edge_minimap.spans)
         assert edge_minimap.count("┌") == 1
