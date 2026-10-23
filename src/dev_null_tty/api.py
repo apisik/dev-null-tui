@@ -28,6 +28,7 @@ REDIRECT_URI = "devnull://auth/callback"
 LogName = Literal["following", "latest", "trending"]
 MAX_COMMIT_IMAGES = 3
 MAX_COMMIT_IMAGE_BYTES = 10_240_000
+LOG_PAGE_SIZE = 20
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ class ApiCommit:
     images: tuple[ApiCommitImage, ...] = ()
     quoted_commit_id: str | None = None
     quoted_commit: ApiCommitPreview | None = None
+    deleted: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,9 +136,16 @@ class DeviceAuthorization:
 class ApiError(Exception):
     """An expected error returned by the signed API."""
 
-    def __init__(self, message: str, code: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        code: str | None = None,
+        *,
+        http_status: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.http_status = http_status
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -177,6 +186,21 @@ def existing_device_identity() -> Path | None:
         return None
     ensure_device_directory()
     return _load_existing_device_keypair()
+
+
+def saved_device_identity_files_exist() -> bool:
+    """Check for a safe-looking keypair without invoking ssh-keygen."""
+
+    if DEVICE_DIRECTORY.is_symlink() or not DEVICE_DIRECTORY.is_dir():
+        return False
+    private_key = DEVICE_DIRECTORY / "id_ed25519"
+    public_key = DEVICE_DIRECTORY / "id_ed25519.pub"
+    return (
+        not private_key.is_symlink()
+        and not public_key.is_symlink()
+        and private_key.is_file()
+        and public_key.is_file()
+    )
 
 
 def remove_device_identity() -> None:
@@ -1007,6 +1031,32 @@ class SignedApiClient:
         try:
             if not isinstance(payload, dict):
                 raise TypeError
+            deleted_at = payload.get("deleted_at")
+            if deleted_at is not None:
+                commit_id = payload["id"]
+                stars_count = payload.get("stars_count", 0)
+                replies_count = payload.get("replies_count", 0)
+                if (
+                    not isinstance(commit_id, str)
+                    or not isinstance(deleted_at, str)
+                    or not isinstance(stars_count, int)
+                    or isinstance(stars_count, bool)
+                    or stars_count < 0
+                    or not isinstance(replies_count, int)
+                    or isinstance(replies_count, bool)
+                    or replies_count < 0
+                ):
+                    raise TypeError
+                return ApiCommit(
+                    id=commit_id,
+                    username="",
+                    author_name=None,
+                    body="",
+                    created_at=deleted_at,
+                    stars_count=stars_count,
+                    replies_count=replies_count,
+                    deleted=True,
+                )
             author = payload["author"]
             quoted_commit_id = payload.get("quoted_commit_id")
             if quoted_commit_id is not None and not isinstance(quoted_commit_id, str):
@@ -1202,7 +1252,7 @@ class SignedApiClient:
                 else:
                     message = f"The API returned HTTP {error.code} without a JSON error response."
                 code = None
-            raise ApiError(message, code) from error
+            raise ApiError(message, code, http_status=error.code) from error
         except urllib.error.URLError as error:
             raise ApiError(f"Could not reach {self.origin}: {error.reason}") from error
         except json.JSONDecodeError as error:

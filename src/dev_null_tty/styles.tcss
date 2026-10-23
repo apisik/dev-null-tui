@@ -448,11 +448,6 @@ ListItem {
     border: round $muted;
 }
 
-ListItem:hover {
-    background: $lighter-background;
-    border: round $primary;
-}
-
 ListView > ListItem.-highlight {
     color: $bright-foreground;
     background: $selection;

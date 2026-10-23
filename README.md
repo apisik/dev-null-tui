@@ -6,7 +6,10 @@ with [Textual](https://textual.textualize.io/) and managed with
 
 The **Following**, **Latest**, and **Trending** journals load real commits from
 the signed `/api/v1/log/{log}` endpoint after sign-in. Each journal supports
-automatic cursor-based infinite scrolling. Guest users can view the profile
+automatic cursor-based infinite scrolling, with a bottom-right notification
+while another page loads. When a selected commit is clipped, `j` / `k` scroll
+it into view before changing selection; oversized commits scroll through before
+advancing. Guest users can view the profile
 and sign in; journals require an approved device. Signed-in
 users can browse a cursor-paginated notifications inbox, publish commits,
 reply to a commit, or quote it. Opening the notifications inbox marks
@@ -41,11 +44,12 @@ are labeled beside the commenter's name; the replying-to pane also shows the
 quoted author's name and text inline. Quoted text wraps to the available width,
 and deleted or unavailable targets are labeled where previews are shown. In a
 commit thread, press `i` to open
-the current commit's expanded image view. A minimap overlay appears
+the current commit's expanded image view. Opening a commit preloads its attached images
+into a bounded in-memory cache for faster browsing. A minimap overlay appears
 in the upper-left corner. The full image initially fits inside the available
 view frame without stretching; zooming moves a frame-sized viewport over it.
 Use `n` / `Ctrl+N` to move to
-the next / previous image, `=` / `-` to zoom in / out, and `h` / `j` / `k` / `l`
+the next / previous image (wrapping at either end), `=` / `-` to zoom in / out, and `h` / `j` / `k` / `l`
 to pan while zoomed. A compact square minimap appears while zoomed, showing the
 view position as a dot; the image edge turns red when you reach it. Panning
 allows a small buffer beyond the image edges, and the image-view keybinds remain
@@ -58,7 +62,9 @@ highlighted help line shows the active image keybinds. The composer action
 buttons share one row at the bottom.
 Press `Enter` on a selected journal entry to open its full commit and replies.
 Use `j` / `k` to navigate replies; if the selected reply is partly obscured,
-they first scroll it fully into view. Press `Enter` to follow a reply into its
+they first scroll it into view. Oversized replies scroll through their remaining
+content before selection advances. Deleted replies remain visible as tombstones
+and cannot be opened or acted on. Press `Enter` to follow a reply into its
 own thread, `u` to move to the parent comment, and `q` or `Escape` to return to
 the previous screen. Commit details show the ancestor and parent-comment
 context in a scrollable pane on the left, and the comment being replied to
@@ -85,6 +91,19 @@ The device key stays in `~/.dev-null-tui/`. On each launch, the app checks that
 key with a signed `GET /api/v1/me` and restores the profile when the device is
 still approved. A revoked or unapproved key is retained, but the app remains
 signed out so you can authorize a device again.
+
+Signed-in journal pages are cached locally under
+`$XDG_CACHE_HOME/dev-null-tui/` (or `~/.cache/dev-null-tui/` when
+`XDG_CACHE_HOME` is unset). Cache files are private to the account and the
+cache directory/file use owner-only permissions. Each journal keeps at most
+one page of commits; cached pages display immediately at startup while the
+active journal refreshes in the background. Other cached journals refresh when
+opened. The last signed-in profile is cached too, so the profile and journal
+cards can render while an existing saved device key is being checked. This
+cached view does not enable signed-in actions until the API confirms the
+device. An explicit authentication rejection clears that account's cached
+profile and journals; missing keys, network errors, and manual logout leave the
+cache intact.
 
 **Log out** removes the local private and public key files and clears the
 in-memory session; callback handoff data and the callback-handler registration

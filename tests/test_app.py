@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 from contextlib import nullcontext
 from io import BytesIO
 from pathlib import Path
@@ -57,11 +58,13 @@ from dev_null_tty.api import (
     resolve_ssh_identity,
     signed_headers,
 )
+from dev_null_tty.log_cache import CommitLogCache, StartupProfileCache
 
 
 @pytest.fixture(autouse=True)
 def avoid_live_session_restore(monkeypatch) -> None:
     monkeypatch.setattr("dev_null_tty.existing_device_identity", lambda: None)
+    monkeypatch.setattr("dev_null_tty.saved_device_identity_files_exist", lambda: False)
     monkeypatch.setattr("dev_null_tty.register_uri_handler", lambda: None)
 
 
@@ -104,15 +107,101 @@ async def test_app_starts_on_latest_log() -> None:
     async with app.run_test():
         assert app.query_one("#views", ContentSwitcher).current == "latest-view"
         assert str(app.query_one("#view-title", Label).render()) == "LOG / LATEST"
+        assert app.focused is app.query_one("#latest-list")
+        latest_button = app.query_one("#latest-log", Button)
+        assert latest_button.variant == "primary"
+        assert latest_button.has_class("active")
         bound_keys = {
             binding.key if isinstance(binding, Binding) else binding[0]
             for binding in app.BINDINGS
         }
-        assert not any(key in {"1", "2", "3", "4"} for key in bound_keys)
+        assert {"1", "2", "3"} <= bound_keys
+        assert "4" not in bound_keys
+        assert "[1]" in str(app.query_one("#latest-log", Button).render())
+        assert "[2]" in str(app.query_one("#following-log", Button).render())
+        assert "[3]" in str(app.query_one("#trending-log", Button).render())
         assert not app.query("#new-commit")
         assert not app.query("#reply-selected")
         assert not app.query("#quote-selected")
         assert not app.query("#search")
+
+
+@pytest.mark.asyncio
+async def test_cached_full_new_page_replaces_log_and_reports_lower_bound(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    cache = CommitLogCache("octocat")
+    old_commits = tuple(
+        ApiCommit(
+            f"old-{index}",
+            "octocat",
+            "The Octocat",
+            f"Old journal entry {index}",
+            "2026-10-20T18:00:00Z",
+            0,
+            0,
+        )
+        for index in range(20)
+    )
+    new_commits = tuple(
+        ApiCommit(
+            f"new-{index}",
+            "octocat",
+            "The Octocat",
+            f"New journal entry {index}",
+            "2026-10-21T18:00:00Z",
+            0,
+            0,
+        )
+        for index in range(20)
+    )
+    cache.save_log({}, "latest", old_commits, 20)
+
+    class FakeClient:
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            assert log_name == "latest"
+            assert cursor is None
+            return ApiLog(new_commits, "older-page", False, 0, ())
+
+    app = DevNullApp()
+    notifications: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "notify",
+        lambda message, **kwargs: notifications.append(str(message)),
+    )
+    async with app.run_test() as pilot:
+        app._set_authenticated_user(
+            FakeClient(),
+            ApiUser("octocat", "The Octocat", None, None),
+        )
+        await app._restore_cached_logs()
+        assert [
+            card.commit.id for card in app.query_one("#latest-list").children
+        ] == [commit.id for commit in old_commits]
+
+        app._show_log("latest")
+        for _ in range(40):
+            if not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
+        assert app.log_new_commit_counts["latest"] == 20
+        assert any("20+ new commits." in message for message in notifications)
+
+        await pilot.press("1", "1")
+        await pilot.pause()
+
+        assert [
+            card.commit.id for card in app.query_one("#latest-list").children
+        ] == [commit.id for commit in new_commits]
+        assert app.log_cursors["latest"] == "older-page"
+        refreshed_cache = cache.load()["latest"]
+        assert len(refreshed_cache.commits) == 20
+        assert [commit.id for commit in refreshed_cache.commits] == [
+            commit.id for commit in new_commits
+        ]
 
 
 @pytest.mark.asyncio
@@ -407,6 +496,215 @@ async def test_app_restores_saved_device_session(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_startup_shows_cached_profile_and_journal_while_auth_is_pending(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr("dev_null_tty.existing_device_identity", lambda: tmp_path / "key")
+    monkeypatch.setattr("dev_null_tty.saved_device_identity_files_exist", lambda: True)
+    StartupProfileCache().save(
+        ApiUser("octocat", "Cached Octocat", None, "Cached bio.")
+    )
+    CommitLogCache("octocat").save_log(
+        {},
+        "latest",
+        (
+            ApiCommit(
+                "cached-commit",
+                "octocat",
+                "Cached Octocat",
+                "Cached journal entry.",
+                "2026-10-20T18:00:00Z",
+                0,
+                0,
+            ),
+        ),
+        20,
+    )
+    auth_started = threading.Event()
+    allow_auth = threading.Event()
+
+    class FakeClient:
+        def __init__(self, key_path) -> None:
+            pass
+
+        def get_current_user(self) -> ApiUser:
+            auth_started.set()
+            assert allow_auth.wait(timeout=3)
+            return ApiUser("octocat", "Verified Octocat", None, "Verified bio.")
+
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            return ApiLog((), None, False, 0, ())
+
+    monkeypatch.setattr("dev_null_tty.SignedApiClient", FakeClient)
+    app = DevNullApp()
+    assert app.optimistic_cached_user == ApiUser(
+        "octocat",
+        "Cached Octocat",
+        None,
+        "Cached bio.",
+    )
+    assert app.startup_cached_logs["latest"][0].id == "cached-commit"
+
+    async with app.run_test() as pilot:
+        assert app.query("Footer")
+        assert app.query_one("#latest-list").children[0].commit.id == "cached-commit"
+        for _ in range(40):
+            if (
+                auth_started.is_set()
+                and app.optimistic_cached_user is not None
+                and app.query("#latest-list CommitCard")
+            ):
+                break
+            await pilot.pause(0.05)
+        assert auth_started.is_set()
+        assert app.authenticated_user is None
+        assert "Cached Octocat" in str(app.query_one("#profile-card", Static).render())
+        assert app.query_one("#latest-list").children[0].commit.id == "cached-commit"
+
+        allow_auth.set()
+        for _ in range(40):
+            if app.authenticated_user is not None:
+                break
+            await pilot.pause(0.05)
+
+        assert app.authenticated_user == ApiUser(
+            "octocat",
+            "Verified Octocat",
+            None,
+            "Verified bio.",
+        )
+        assert StartupProfileCache().load() == app.authenticated_user
+
+
+@pytest.mark.asyncio
+async def test_rejected_saved_key_clears_its_cached_profile_and_journals(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr("dev_null_tty.existing_device_identity", lambda: tmp_path / "key")
+    monkeypatch.setattr("dev_null_tty.saved_device_identity_files_exist", lambda: True)
+    StartupProfileCache().save(ApiUser("octocat", "The Octocat", None, "Bio."))
+    cache = CommitLogCache("octocat")
+    cache.save_log(
+        {},
+        "latest",
+        (
+            ApiCommit(
+                "cached-commit",
+                "octocat",
+                "The Octocat",
+                "Cached entry.",
+                "2026-10-20T18:00:00Z",
+                0,
+                0,
+            ),
+        ),
+        20,
+    )
+
+    class FakeClient:
+        def __init__(self, key_path) -> None:
+            pass
+
+        def get_current_user(self) -> ApiUser:
+            raise ApiError("The device is not approved.", "device_not_approved")
+
+    monkeypatch.setattr("dev_null_tty.SignedApiClient", FakeClient)
+    app = DevNullApp()
+
+    async with app.run_test() as pilot:
+        for _ in range(40):
+            if app.optimistic_cached_user is None and not app.log_loading["latest"]:
+                await pilot.pause(0.05)
+                if "not approved" in str(app.query_one("#sign-in-status", Static).render()):
+                    break
+            await pilot.pause(0.05)
+
+        assert StartupProfileCache().load() is None
+        assert cache.load() == {}
+        assert not app.query("#latest-list CommitCard")
+
+
+@pytest.mark.asyncio
+async def test_missing_saved_key_keeps_cache_hidden_and_preserved(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    cached_user = ApiUser("octocat", "The Octocat", None, "Bio.")
+    StartupProfileCache().save(cached_user)
+    cache = CommitLogCache("octocat")
+    cache.save_log({}, "latest", (), 20)
+    app = DevNullApp()
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.optimistic_cached_user is None
+        assert "@guest" in str(app.query_one("#profile-card", Static).render())
+        assert StartupProfileCache().load() == cached_user
+        assert cache.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_transient_restore_failure_keeps_optimistic_cache(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr("dev_null_tty.existing_device_identity", lambda: tmp_path / "key")
+    monkeypatch.setattr("dev_null_tty.saved_device_identity_files_exist", lambda: True)
+    cached_user = ApiUser("octocat", "The Octocat", None, "Bio.")
+    StartupProfileCache().save(cached_user)
+    cache = CommitLogCache("octocat")
+    cache.save_log(
+        {},
+        "latest",
+        (
+            ApiCommit(
+                "cached-commit",
+                "octocat",
+                "The Octocat",
+                "Cached entry.",
+                "2026-10-20T18:00:00Z",
+                0,
+                0,
+            ),
+        ),
+        20,
+    )
+
+    class FakeClient:
+        def __init__(self, key_path) -> None:
+            pass
+
+        def get_current_user(self) -> ApiUser:
+            raise ApiError("Could not reach the API.")
+
+    monkeypatch.setattr("dev_null_tty.SignedApiClient", FakeClient)
+    app = DevNullApp()
+
+    async with app.run_test() as pilot:
+        for _ in range(40):
+            if (
+                app.optimistic_cached_user == cached_user
+                and "Could not reach" in str(app.query_one("#sign-in-status", Static).render())
+                and app.query("#latest-list CommitCard")
+            ):
+                break
+            await pilot.pause(0.05)
+
+        assert app.optimistic_cached_user == cached_user
+        assert StartupProfileCache().load() == cached_user
+        assert [card.commit.id for card in app.query_one("#latest-list").children] == [
+            "cached-commit"
+        ]
+        assert cache.path.exists()
+
+
+@pytest.mark.asyncio
 async def test_navigation_switches_views() -> None:
     app = DevNullApp()
     async with app.run_test():
@@ -421,22 +719,19 @@ async def test_navigation_switches_views() -> None:
 
 
 @pytest.mark.asyncio
-async def test_journal_navigation_wraps_around() -> None:
+async def test_log_actions_switch_between_journals() -> None:
     app = DevNullApp()
     async with app.run_test():
-        app._move_journal(-1)
+        app.action_show_following()
+        assert app.active_log == "following"
+        app.action_show_trending()
         assert app.active_log == "trending"
-        app._move_journal(1)
-        assert app.active_log == "latest"
-        app._show_log("following")
-        app._move_journal(1)
-        assert app.active_log == "trending"
-        app._move_journal(1)
+        app.action_show_feed()
         assert app.active_log == "latest"
 
 
 @pytest.mark.asyncio
-async def test_cached_journals_refresh_immediately_when_reselected() -> None:
+async def test_cached_journals_do_not_reload_when_reselected() -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str | None]] = []
@@ -477,40 +772,157 @@ async def test_cached_journals_refresh_immediately_when_reselected() -> None:
 
         app._show_log("latest")
         assert app.query_one("#latest-list").children[0].commit.id == "latest-1"
-        await wait_for_load("latest", 2)
-        assert app.query_one("#latest-list").children[0].commit.id == "latest-2"
+        assert sum(name == "latest" for name, _ in client.calls) == 1
 
         app._show_log("following")
         assert app.query_one("#following-list").children[0].commit.id == "following-1"
-        await wait_for_load("following", 2)
-        assert app.query_one("#following-list").children[0].commit.id == "following-2"
+        assert sum(name == "following" for name, _ in client.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_r_refreshes_active_journal() -> None:
+async def test_r_refreshes_active_journal(monkeypatch) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.refresh_started = threading.Event()
+            self.allow_refresh = threading.Event()
+
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            self.calls += 1
+            if self.calls == 2:
+                self.refresh_started.set()
+                self.allow_refresh.wait(timeout=3)
+            commits = (
+                tuple(
+                    ApiCommit(
+                        f"latest-{index}",
+                        "octocat",
+                        "The Octocat",
+                        f"Journal entry {index}",
+                        "2026-10-20T18:00:00Z",
+                        0,
+                        0,
+                    )
+                    for index in range(1, 13)
+                )
+                if self.calls == 1
+                else tuple(
+                    ApiCommit(
+                        f"latest-{index}",
+                        "octocat",
+                        "The Octocat",
+                        f"Journal entry {index}",
+                        "2026-10-20T18:00:00Z",
+                        0,
+                        0,
+                    )
+                    for index in (13, 9, 8)
+                )
+            )
+            return ApiLog(commits, None, False, 0, ())
+
+    app = DevNullApp()
+    client = FakeClient()
+    app.api_client = client
+    notifications: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "notify",
+        lambda message, **kwargs: notifications.append(str(message)),
+    )
+
+    async with app.run_test() as pilot:
+        app._show_log("latest")
+        for _ in range(20):
+            if client.calls == 1 and not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
+
+        journal = app.query_one("#latest-list")
+        journal.index = 8
+        journal.focus()
+        await pilot.pause()
+        selected_id = journal.children[journal.index].commit.id
+        viewport = journal.content_region
+        anchor = next(
+            item
+            for item in journal.children
+            if item.region.bottom > viewport.y
+        )
+        anchor_id = anchor.commit.id
+        anchor_offset = anchor.region.y - viewport.y
+        await pilot.press("r")
+        for _ in range(20):
+            if client.refresh_started.is_set():
+                break
+            await pilot.pause(0.05)
+        assert client.refresh_started.is_set()
+        status = app.query_one("#latest-status", Static)
+        assert not status.display
+        assert notifications == ["Refreshing..."]
+        client.allow_refresh.set()
+        for _ in range(20):
+            if client.calls == 2 and not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
+        await pilot.pause()
+
+        assert client.calls == 2
+        assert [card.commit.id for card in journal.children] == [
+            f"latest-{index}" for index in range(1, 13)
+        ]
+        assert journal.index == 8
+        assert journal.children[journal.index].commit.id == selected_id
+        assert app.log_new_commit_counts["latest"] == 1
+        assert "1 new commit. Double press 1 to scroll to top." in notifications[-1]
+        restored_anchor = next(
+            item for item in journal.children if item.commit.id == anchor_id
+        )
+        assert restored_anchor.region.y - journal.content_region.y == anchor_offset
+
+        await pilot.press("1", "1")
+        await pilot.pause()
+        refreshed_ids = [card.commit.id for card in journal.children]
+        expected_ids = [
+            "latest-13",
+            "latest-9",
+            "latest-8",
+            *[f"latest-{index}" for index in range(1, 8)],
+            *[f"latest-{index}" for index in range(10, 13)],
+        ]
+        assert refreshed_ids == expected_ids
+        assert refreshed_ids.count(selected_id) == 1
+        assert all(
+            "Journal entry"
+            in card.query_one(LinkedText).content.plain
+            for card in journal.children
+        )
+        assert journal.index == 0
+        assert journal.scroll_y == 0
+        assert journal.max_scroll_y > 0
+        assert journal.vertical_scrollbar.position == 0
+        assert journal.vertical_scrollbar.window_virtual_size == journal.virtual_size.height
+        assert app.log_new_commit_counts["latest"] == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_refresh_fetches_the_active_journal() -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.calls = 0
 
         def get_log(self, log_name, cursor=None) -> ApiLog:
             self.calls += 1
-            return ApiLog(
-                (
-                    ApiCommit(
-                        f"latest-{self.calls}",
-                        "octocat",
-                        "The Octocat",
-                        f"Journal version {self.calls}",
-                        "2026-10-20T18:00:00Z",
-                        0,
-                        0,
-                    ),
-                ),
-                None,
-                False,
+            commit = ApiCommit(
+                f"latest-{self.calls}",
+                "octocat",
+                "The Octocat",
+                f"Journal version {self.calls}",
+                "2026-10-20T18:00:00Z",
                 0,
-                (),
+                0,
             )
+            return ApiLog((commit,), None, False, 0, ())
 
     app = DevNullApp()
     client = FakeClient()
@@ -523,15 +935,23 @@ async def test_r_refreshes_active_journal() -> None:
                 break
             await pilot.pause(0.05)
 
-        app.query_one("#latest-list").focus()
-        await pilot.press("r")
+        app._auto_refresh_active_log()
         for _ in range(20):
             if client.calls == 2 and not app.log_loading["latest"]:
                 break
             await pilot.pause(0.05)
 
         assert client.calls == 2
-        assert app.query_one("#latest-list").children[0].commit.id == "latest-2"
+        assert [
+            card.commit.id for card in app.query_one("#latest-list").children
+        ] == ["latest-1"]
+        assert app.log_new_commit_counts["latest"] == 1
+        await pilot.press("1", "1")
+        await pilot.pause()
+        assert [card.commit.id for card in app.query_one("#latest-list").children] == [
+            "latest-2",
+            "latest-1",
+        ]
 
 
 @pytest.mark.asyncio
@@ -855,7 +1275,11 @@ async def test_commit_attachments_are_indicators_and_image_view_navigates() -> N
         assert not card.query(CommitImagePreview)
 
         app.push_screen(CommitDetailScreen(commit, client))
-        await pilot.pause(0.1)
+        for _ in range(20):
+            if len(requested_images) == 2:
+                break
+            await pilot.pause(0.05)
+        assert set(requested_images) == {"image-1", "image-2"}
         detail = app.screen
         mode = detail.query_one("#thread-mode", ContentSwitcher)
         assert mode.current == "thread-columns"
@@ -869,7 +1293,7 @@ async def test_commit_attachments_are_indicators_and_image_view_navigates() -> N
                 break
             await pilot.pause(0.05)
         assert preview._loaded
-        assert requested_images == ["image-1"]
+        assert set(requested_images) == {"image-1", "image-2"}
         assert preview.source_image.size == (800, 600)
         assert "IMAGE 1 / 2" in viewer.query_one("#thread-image-caption", Label).render().plain
         assert not viewer.query("#thread-image-help")
@@ -1018,9 +1442,26 @@ async def test_commit_attachments_are_indicators_and_image_view_navigates() -> N
             await pilot.pause(0.05)
         assert preview._loaded
         assert preview.image_info == images[1]
-        assert requested_images == ["image-1", "image-2"]
+        assert set(requested_images) == {"image-1", "image-2"}
 
         await pilot.press("ctrl+n")
+        for _ in range(20):
+            if preview._loaded and preview.image_info == images[0]:
+                break
+            await pilot.pause(0.05)
+        assert preview._loaded
+        assert preview.image_info == images[0]
+        assert set(requested_images) == {"image-1", "image-2"}
+
+        await pilot.press("ctrl+n")
+        for _ in range(20):
+            if preview._loaded and preview.image_info == images[1]:
+                break
+            await pilot.pause(0.05)
+        assert preview._loaded
+        assert preview.image_info == images[1]
+
+        await pilot.press("n")
         for _ in range(20):
             if preview._loaded and preview.image_info == images[0]:
                 break
@@ -1071,6 +1512,9 @@ async def test_short_journal_auto_loads_until_it_fills_viewport() -> None:
 
 @pytest.mark.asyncio
 async def test_scrolling_to_end_loads_next_journal_page() -> None:
+    page_two_started = threading.Event()
+    allow_page_two = threading.Event()
+
     class FakeClient:
         cursors = []
 
@@ -1090,6 +1534,8 @@ async def test_scrolling_to_end_loads_next_journal_page() -> None:
                     for index in range(20)
                 )
                 return ApiLog(commits, "page-2", False, 0, ())
+            page_two_started.set()
+            allow_page_two.wait(timeout=2)
             return ApiLog(
                 (
                     ApiCommit(
@@ -1110,6 +1556,8 @@ async def test_scrolling_to_end_loads_next_journal_page() -> None:
 
     app = DevNullApp()
     app.api_client = FakeClient()
+    notifications = []
+    app.notify = lambda message, **kwargs: notifications.append(str(message))
 
     async with app.run_test() as pilot:
         app._show_log("latest")
@@ -1119,9 +1567,22 @@ async def test_scrolling_to_end_loads_next_journal_page() -> None:
         assert list_view.max_scroll_y > 0
 
         list_view.scroll_y = list_view.max_scroll_y
-        await pilot.pause(0.1)
+        for _ in range(20):
+            if page_two_started.is_set():
+                break
+            await pilot.pause(0.05)
+        assert page_two_started.is_set()
+        app._on_journal_scroll_end("latest")
+        app._on_journal_scroll_end("latest")
+        assert notifications == ["Loading more commits..."]
+        allow_page_two.set()
+        for _ in range(20):
+            if not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
 
         assert app.api_client.cursors == [None, "page-2"]
+        assert notifications == ["Loading more commits..."]
         assert len(app.query("#latest-list CommitCard")) == 21
 
 
@@ -1158,10 +1619,116 @@ async def test_vim_keys_navigate_journals_and_commits() -> None:
         assert app.query_one("#latest-list").index == 1
         await pilot.press("k")
         assert app.query_one("#latest-list").index == 0
-        await pilot.press("l")
+        await pilot.press("2")
         assert app.query_one("#views", ContentSwitcher).current == "following-view"
-        await pilot.press("h")
+        await pilot.press("3")
+        assert app.query_one("#views", ContentSwitcher).current == "trending-view"
+        await pilot.press("1")
         assert app.query_one("#views", ContentSwitcher).current == "latest-view"
+
+
+@pytest.mark.asyncio
+async def test_journal_navigation_scrolls_through_oversized_selected_commit() -> None:
+    commits = tuple(
+        ApiCommit(
+            f"commit-{index}",
+            "octocat",
+            "The Octocat",
+            f"Entry {index} " + ("long commit content. " * 150 if index == 4 else ""),
+            "2026-10-20T18:00:00Z",
+            0,
+            0,
+        )
+        for index in range(8)
+    )
+
+    class FakeClient:
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            return ApiLog(commits, None, False, 0, ())
+
+    app = DevNullApp()
+    app.api_client = FakeClient()
+
+    async with app.run_test(size=(100, 25)) as pilot:
+        app._show_log("latest")
+        for _ in range(20):
+            if not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
+
+        journal = app.query_one("#latest-list")
+        journal.index = 4
+        journal.focus()
+        await pilot.pause()
+        selected_commit = journal.children[4]
+        journal.scroll_to(
+            y=journal.scroll_y + selected_commit.region.y - journal.content_region.y,
+            animate=False,
+            force=True,
+        )
+        await pilot.pause()
+        assert selected_commit.region.height > journal.content_region.height
+        assert selected_commit.region.y >= journal.content_region.y
+        assert selected_commit.region.bottom > journal.content_region.bottom
+
+        previous_scroll_y = journal.scroll_y
+        await pilot.press("j")
+        await pilot.pause()
+        assert journal.index == 4
+        assert journal.scroll_y > previous_scroll_y
+        for _ in range(40):
+            if selected_commit.region.bottom <= journal.content_region.bottom:
+                break
+            await pilot.press("j")
+            await pilot.pause()
+            assert journal.index == 4
+        assert selected_commit.region.bottom <= journal.content_region.bottom
+
+        await pilot.press("j")
+        assert journal.index == 5
+
+
+@pytest.mark.asyncio
+async def test_double_log_number_scrolls_to_top_without_pending_commits() -> None:
+    class FakeClient:
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            commits = tuple(
+                ApiCommit(
+                    f"commit-{index}",
+                    "octocat",
+                    "The Octocat",
+                    f"Entry {index}",
+                    "2026-10-20T18:00:00Z",
+                    0,
+                    0,
+                )
+                for index in range(20)
+            )
+            return ApiLog(commits, None, False, 0, ())
+
+    app = DevNullApp()
+    app.api_client = FakeClient()
+
+    async with app.run_test() as pilot:
+        app._show_log("latest")
+        for _ in range(20):
+            if app.log_loaded["latest"] and not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
+
+        list_view = app.query_one("#latest-list")
+        list_view.scroll_to(y=list_view.max_scroll_y, animate=False, force=True)
+        await pilot.pause()
+        assert list_view.scroll_y > 0
+        assert app.log_new_commit_counts["latest"] == 0
+
+        await pilot.press("1", "1")
+        await pilot.pause()
+        assert list_view.scroll_y == 0
+        assert list_view.index == 0
+        assert list_view.max_scroll_y > 0
+        assert list_view.vertical_scrollbar.position == 0
+        assert list_view.vertical_scrollbar.window_virtual_size == list_view.virtual_size.height
 
 
 @pytest.mark.asyncio
@@ -1406,7 +1973,8 @@ async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
             f"reply-{index}",
             "octocat",
             "The Octocat",
-            f"Reply {index}",
+            f"Reply {index} "
+            + ("long reply content. " * 100 if index == 11 else ""),
             "2026-10-20T18:00:00Z",
             0,
             0,
@@ -1540,18 +2108,35 @@ async def test_enter_opens_commit_detail_and_loads_paginated_replies() -> None:
         replies.index = 11
         await pilot.pause()
         selected_reply = replies.children[11]
-        replies.scroll_y += 1
-        await pilot.pause()
-        assert (
-            selected_reply.region.y < replies.content_region.y
-            or selected_reply.region.bottom > replies.content_region.bottom
+        replies.scroll_to(
+            y=replies.scroll_y + selected_reply.region.y - replies.content_region.y,
+            animate=False,
+            force=True,
         )
-        reply_fits = selected_reply.region.height <= replies.content_region.height
-        await pilot.press("j")
         await pilot.pause()
+        reply_fits = selected_reply.region.height <= replies.content_region.height
         if reply_fits:
+            assert selected_reply.region.bottom > replies.content_region.bottom
+            await pilot.press("j")
+            await pilot.pause()
             assert replies.index == 11
             assert selected_reply.region.y >= replies.content_region.y
+            assert selected_reply.region.bottom <= replies.content_region.bottom
+            await pilot.press("j")
+        else:
+            assert selected_reply.region.y >= replies.content_region.y
+            assert selected_reply.region.bottom > replies.content_region.bottom
+            previous_scroll_y = replies.scroll_y
+            await pilot.press("j")
+            await pilot.pause()
+            assert replies.index == 11
+            assert replies.scroll_y > previous_scroll_y
+            for _ in range(30):
+                if selected_reply.region.bottom <= replies.content_region.bottom:
+                    break
+                await pilot.press("j")
+                await pilot.pause()
+                assert replies.index == 11
             assert selected_reply.region.bottom <= replies.content_region.bottom
             await pilot.press("j")
         assert replies.index == 12
@@ -1745,6 +2330,26 @@ def test_commit_display_renders_quoted_commit_preview() -> None:
     assert "Bob @bob" in rendered.plain
     assert "The original idea." in rendered.plain
 
+    long_quote = f"{'quoted text ' * 30}FULL_QUOTE_END"
+    long_quote_commit = ApiCommit(
+        "long-quote-post",
+        "alice",
+        "Alice",
+        "A post with a long quote.",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+        quoted_commit_id="long-original",
+        quoted_commit=ApiCommitPreview(
+            "long-original",
+            "bob",
+            "Bob",
+            long_quote,
+        ),
+    )
+    long_quote_rendered = _commit_display(long_quote_commit, 600, show_counts=True)
+    assert "FULL_QUOTE_END" in long_quote_rendered.plain
+
     thread_rendered = _commit_display(
         commit,
         600,
@@ -1766,8 +2371,7 @@ def test_commit_display_renders_quoted_commit_preview() -> None:
     )
     assert "Alice @alice · " in replying_to_rendered.plain
     assert " · quoted reply" in replying_to_rendered.plain
-    assert "Bob @bob: “The original idea.”" in replying_to_rendered.plain
-    assert "QUOTED COMMIT" not in replying_to_rendered.plain
+    assert "╭─ QUOTED COMMIT\n│ Bob @bob\n│ The original idea.\n╰─" in replying_to_rendered.plain
 
 
 def test_commit_display_marks_deleted_and_unavailable_quote_targets() -> None:
@@ -1801,6 +2405,127 @@ def test_commit_display_marks_deleted_and_unavailable_quote_targets() -> None:
     assert "Original commit is unavailable." in _commit_display(
         unavailable_commit, 600
     ).plain
+
+
+@pytest.mark.asyncio
+async def test_deleted_reply_tombstone_renders_without_opening_detail() -> None:
+    root = ApiCommit(
+        "root-id",
+        "octocat",
+        "The Octocat",
+        "Root commit",
+        "2026-10-20T18:00:00Z",
+        0,
+        1,
+    )
+    deleted_reply = SignedApiClient._commit_from_payload(
+        {
+            "id": "deleted-reply",
+            "deleted_at": "2026-10-20T18:30:00Z",
+            "replies_count": 2,
+        }
+    )
+    detail_requests = []
+
+    class FakeClient:
+        def get_commit_detail(self, commit_id) -> ApiCommitDetail:
+            detail_requests.append(commit_id)
+            return ApiCommitDetail(root, ())
+
+        def get_replies(self, commit_id, cursor=None) -> ApiLog:
+            return ApiLog((deleted_reply,), None, False, 0, ())
+
+    app = DevNullApp()
+    client = FakeClient()
+
+    async with app.run_test() as pilot:
+        app.push_screen(CommitDetailScreen(root, client))
+        await pilot.pause(0.1)
+        for _ in range(20):
+            replies = app.screen.query_one("#commit-replies")
+            if replies.children:
+                break
+            await pilot.pause(0.05)
+        assert len(replies.children) == 1
+        deleted_text = replies.children[0].query_one(LinkedText).content
+        assert isinstance(deleted_text, Text)
+        assert deleted_text.plain == "This reply was deleted."
+
+        replies.index = 0
+        replies.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, CommitDetailScreen)
+        assert app.screen.current_level.commit == root
+        assert detail_requests == ["root-id"]
+
+
+@pytest.mark.asyncio
+async def test_quote_detail_shows_full_quoted_commit_and_opens_it() -> None:
+    quoted_body = ("Complete quoted text. " * 30) + "QUOTE_END_SENTINEL"
+    quoted_commit = ApiCommit(
+        "quoted-commit",
+        "bob",
+        "Bob",
+        quoted_body,
+        "2026-10-20T17:00:00Z",
+        0,
+        0,
+    )
+    quote = ApiCommit(
+        "quote-commit",
+        "alice",
+        "Alice",
+        "A post quoting Bob.",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+        quoted_commit_id=quoted_commit.id,
+        quoted_commit=ApiCommitPreview(
+            quoted_commit.id,
+            quoted_commit.username,
+            quoted_commit.author_name,
+            "Short quoted preview.",
+        ),
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.detail_requests: list[str] = []
+
+        def get_commit_detail(self, commit_id: str) -> ApiCommitDetail:
+            self.detail_requests.append(commit_id)
+            if commit_id == quote.id:
+                return ApiCommitDetail(quote, ())
+            if commit_id == quoted_commit.id:
+                return ApiCommitDetail(quoted_commit, ())
+            raise AssertionError(f"Unexpected commit detail request: {commit_id}")
+
+        def get_replies(self, commit_id: str, cursor=None) -> ApiLog:
+            return ApiLog((), None, False, 0, ())
+
+    client = FakeClient()
+    app = DevNullApp()
+
+    async with app.run_test() as pilot:
+        app.push_screen(CommitDetailScreen(quote, client))
+        await pilot.pause()
+        for _ in range(30):
+            current_text = app.screen.query_one("#current-commit", LinkedText).content
+            if "QUOTE_END_SENTINEL" in current_text.plain:
+                break
+            await pilot.pause(0.05)
+
+        assert "QUOTE_END_SENTINEL" in current_text.plain
+        assert client.detail_requests.count(quoted_commit.id) == 1
+        assert "o quoted commit" in app.screen.query_one("#detail-help", Static).render().plain
+
+        await pilot.press("o")
+        await pilot.pause()
+
+        assert isinstance(app.screen, CommitDetailScreen)
+        assert app.screen.current_level.commit.id == quoted_commit.id
 
 
 def test_quoted_commit_lines_wrap_to_available_width() -> None:
@@ -2024,6 +2749,32 @@ def test_api_requests_identify_the_client(monkeypatch, tmp_path) -> None:
     assert opener.request.get_header("User-agent") == "dev-null-tty"
 
 
+def test_signed_api_error_preserves_http_status(monkeypatch, tmp_path) -> None:
+    from urllib.error import HTTPError
+
+    import dev_null_tty.api as api
+
+    monkeypatch.setattr(api, "signed_headers", lambda *args: {})
+
+    class Opener:
+        def open(self, request, timeout: int):
+            raise HTTPError(
+                request.full_url,
+                403,
+                "Forbidden",
+                {},
+                BytesIO(b'{"message":"Device rejected."}'),
+            )
+
+    client = SignedApiClient(tmp_path / "identity")
+    client._opener = Opener()
+
+    with pytest.raises(ApiError) as error:
+        client.get_current_user()
+
+    assert error.value.http_status == 403
+
+
 def test_device_key_is_created_with_private_permissions(monkeypatch, tmp_path) -> None:
     import dev_null_tty.api as api
 
@@ -2061,6 +2812,7 @@ def test_existing_device_identity_does_not_create_a_key(monkeypatch, tmp_path) -
     monkeypatch.setattr(api, "DEVICE_DIRECTORY", device_dir)
 
     assert existing_device_identity() is None
+    assert not api.saved_device_identity_files_exist()
     assert not device_dir.exists()
 
 
@@ -2075,6 +2827,7 @@ def test_existing_device_identity_returns_saved_key(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(api, "DEVICE_DIRECTORY", device_dir)
     monkeypatch.setattr(api, "_device_fingerprint", lambda path: "SHA256:fingerprint")
 
+    assert api.saved_device_identity_files_exist()
     assert existing_device_identity() == key_path
     assert key_path.stat().st_mode & 0o777 == 0o600
 
@@ -2311,6 +3064,35 @@ def test_get_log_sends_cursor_and_parses_journal(monkeypatch, tmp_path) -> None:
                 "A photo",
             ),
         ),
+    )
+
+
+def test_log_parser_accepts_deleted_reply_tombstones() -> None:
+    tombstone = SignedApiClient._log_from_payload(
+        {
+            "data": [
+                {
+                    "id": "deleted-reply",
+                    "deleted_at": "2026-10-20T18:30:00Z",
+                    "replies_count": 2,
+                }
+            ],
+            "meta": {"next_cursor": None},
+        }
+    ).commits[0]
+
+    assert tombstone == ApiCommit(
+        "deleted-reply",
+        "",
+        None,
+        "",
+        "2026-10-20T18:30:00Z",
+        0,
+        2,
+        deleted=True,
+    )
+    assert _commit_display(tombstone, 600, thread_view=True).plain == (
+        "This reply was deleted."
     )
 
 

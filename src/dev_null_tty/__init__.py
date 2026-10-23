@@ -3,7 +3,8 @@
 import argparse
 import asyncio
 import base64
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from io import BytesIO
@@ -17,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import webbrowser
 from typing import Literal
@@ -50,25 +52,30 @@ from .api import (
     ApiError,
     ApiCommit,
     ApiCommitContext,
+    ApiCommitDetail,
     ApiCommitImage,
     ApiCommitPreview,
     ApiNotification,
     ApiUser,
     DeviceAuthorization,
+    LOG_PAGE_SIZE,
     LogName,
     SignedApiClient,
     authorization_code_from_callback,
     create_device_authorization,
     existing_device_identity,
     remove_device_identity,
+    saved_device_identity_files_exist,
 )
 from .desktop import callback_handoff_path, register_uri_handler
+from .log_cache import CachedLog, CommitLogCache, StartupProfileCache
 from textual_image._terminal import get_cell_size
 from textual_image.widget import Image as TerminalImage
 
 ComposerMode = Literal["new", "reply", "quote"]
 _URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 _IMAGE_PREVIEW_ID = secrets.randbelow(0xFFFFFF) + 1
+_LOG_KEY_DOUBLE_PRESS_SECONDS = 0.65
 _OMARCHY_THEME_COLOR_FIELDS = (
     "accent",
     "selection",
@@ -552,6 +559,7 @@ class CommitImagePreview(Vertical):
         *,
         classes: str = "commit-image-preview",
         on_loaded: Callable[[], None] | None = None,
+        image_loader: Callable[[ApiCommitImage], Awaitable[PILImage.Image]] | None = None,
     ) -> None:
         super().__init__(classes=classes)
         self.image_info = image
@@ -565,6 +573,7 @@ class CommitImagePreview(Vertical):
         self._pan_x = 0.5
         self._pan_y = 0.5
         self._on_loaded = on_loaded
+        self.image_loader = image_loader
         self.display = image is not None
 
     def compose(self) -> ComposeResult:
@@ -575,15 +584,18 @@ class CommitImagePreview(Vertical):
         self,
         image: ApiCommitImage | None,
         client: SignedApiClient | None,
+        image_loader: Callable[[ApiCommitImage], Awaitable[PILImage.Image]] | None = None,
     ) -> None:
         if (
             self.image_info == image
             and self.client is client
+            and self.image_loader is image_loader
             and self.local_image_path is None
         ):
             return
         self.image_info = image
         self.client = client
+        self.image_loader = image_loader
         self.local_image_path = None
         self._reset_source()
 
@@ -592,6 +604,7 @@ class CommitImagePreview(Vertical):
             return
         self.image_info = None
         self.client = None
+        self.image_loader = None
         self.local_image_path = image_path
         self._reset_source()
 
@@ -663,10 +676,15 @@ class CommitImagePreview(Vertical):
             if image_path is not None:
                 contents = await asyncio.to_thread(image_path.read_bytes)
             elif image is not None and client is not None:
-                contents = await asyncio.to_thread(client.get_commit_image, image)
+                if self.image_loader is not None:
+                    preview = await self.image_loader(image)
+                else:
+                    contents = await asyncio.to_thread(client.get_commit_image, image)
+                    preview = await asyncio.to_thread(_decode_commit_image, contents)
             else:
                 return
-            preview = await asyncio.to_thread(_decode_commit_image, contents)
+            if image_path is not None:
+                preview = await asyncio.to_thread(_decode_commit_image, contents)
         except (ApiError, OSError, ValueError, PILImage.DecompressionBombError) as error:
             if self.is_mounted and generation == self._generation:
                 self.query_one(".commit-image-status", Static).update(
@@ -729,9 +747,11 @@ class CommitImageViewer(Vertical):
         client: SignedApiClient | None,
         *,
         id: str,
+        image_loader: Callable[[ApiCommitImage], Awaitable[PILImage.Image]] | None = None,
     ) -> None:
         super().__init__(id=id)
         self.client = client
+        self.image_loader = image_loader
         self.images: tuple[ApiCommitImage, ...] = ()
         self.local_images: tuple[Path, ...] = ()
         self.index = 0
@@ -746,6 +766,7 @@ class CommitImageViewer(Vertical):
             yield CommitImagePreview(
                 classes="detail-image-preview",
                 on_loaded=self._update_minimap,
+                image_loader=self.image_loader,
             )
             with Vertical(id="thread-image-map"):
                 yield Label("OVERVIEW", id="thread-image-minimap-title")
@@ -768,14 +789,14 @@ class CommitImageViewer(Vertical):
         self._show_current_image(load=self.active)
 
     def next_image(self) -> None:
-        if self.image_count and self.index < self.image_count - 1:
-            self.index += 1
+        if self.image_count > 1:
+            self.index = (self.index + 1) % self.image_count
             self._reset_view()
             self._show_current_image(load=True)
 
     def previous_image(self) -> None:
-        if self.image_count and self.index > 0:
-            self.index -= 1
+        if self.image_count > 1:
+            self.index = (self.index - 1) % self.image_count
             self._reset_view()
             self._show_current_image(load=True)
 
@@ -898,7 +919,7 @@ class CommitImageViewer(Vertical):
         if self.local_images:
             preview.set_local_image(self.local_images[self.index])
         else:
-            preview.set_image(self.images[self.index], self.client)
+            preview.set_image(self.images[self.index], self.client, self.image_loader)
         preview.set_transform(self.zoom_factor, self.pan_x, self.pan_y)
         self._update_minimap()
         if load:
@@ -1012,9 +1033,16 @@ class NotificationCard(ListItem):
 
 
 class JournalListView(ListView):
-    def __init__(self, log_name: LogName) -> None:
+    def __init__(
+        self,
+        log_name: LogName,
+        commits: tuple[ApiCommit, ...] = (),
+    ) -> None:
         self.log_name = log_name
-        super().__init__(id=f"{log_name}-list")
+        super().__init__(
+            *(CommitCard(commit) for commit in commits),
+            id=f"{log_name}-list",
+        )
 
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         super().watch_scroll_y(old_value, new_value)
@@ -1030,6 +1058,42 @@ class RepliesListView(ListView):
         super().watch_scroll_y(old_value, new_value)
         if self.is_mounted and self.is_vertical_scroll_end:
             self.app.call_after_refresh(self.app._load_more_commit_replies)
+
+
+def _scroll_list_item_into_view(
+    list_view: ListView,
+    index: int,
+    direction: int,
+) -> bool:
+    item = list_view.children[index]
+    viewport = list_view.content_region
+    if item.region.height > viewport.height:
+        if direction > 0:
+            if item.region.bottom <= viewport.bottom:
+                return False
+            scroll_delta = min(
+                viewport.height,
+                item.region.bottom - viewport.bottom,
+            )
+        else:
+            if item.region.y >= viewport.y:
+                return False
+            scroll_delta = -min(
+                viewport.height,
+                viewport.y - item.region.y,
+            )
+    elif item.region.y < viewport.y:
+        scroll_delta = item.region.y - viewport.y
+    elif item.region.bottom > viewport.bottom:
+        scroll_delta = item.region.bottom - viewport.bottom
+    else:
+        return False
+    list_view.scroll_to(
+        y=list_view.scroll_y + scroll_delta,
+        animate=False,
+        force=True,
+    )
+    return True
 
 
 class NotificationsListView(ListView):
@@ -1565,6 +1629,9 @@ class NotificationDetailScreen(ModalScreen[None]):
 @dataclass
 class CommitThreadLevel:
     commit: ApiCommit
+    quoted_commit_detail: ApiCommitDetail | None = None
+    quoted_commit_loading: bool = False
+    quoted_commit_failed: bool = False
     replies: list[ApiCommit] = field(default_factory=list)
     next_cursor: str | None = None
     replies_loaded: bool = False
@@ -1594,18 +1661,27 @@ class CommitDetailScreen(ModalScreen[None]):
         Binding("h", "pan_left", "Pan left", show=False, priority=True),
         Binding("l", "pan_right", "Pan right", show=False, priority=True),
         Binding("u", "parent_comment", "Parent comment", show=False, priority=True),
+        Binding("o", "open_quoted_commit", "Open quoted commit", show=False, priority=True),
         Binding("q", "back", "Back", show=False, priority=True),
         Binding("escape", "back", "Back", show=False, priority=True),
         Binding("r", "retry_replies", "Retry replies", show=False, priority=True),
     ]
 
-    def __init__(self, commit: ApiCommit, client: SignedApiClient) -> None:
+    def __init__(
+        self,
+        commit: ApiCommit,
+        client: SignedApiClient,
+        initial_detail: ApiCommitDetail | None = None,
+    ) -> None:
         super().__init__()
         self.client = client
         self.levels = [CommitThreadLevel(commit)]
-        self.ancestor_context: tuple[ApiCommitContext, ...] = ()
+        self.ancestor_context = initial_detail.ancestors if initial_detail else ()
+        self.initial_detail_loaded = initial_detail is not None
         self.parent_navigation_loading = False
         self.image_view_active = False
+        self._image_memory_cache: OrderedDict[str, PILImage.Image] = OrderedDict()
+        self._image_loads: dict[str, asyncio.Task[PILImage.Image]] = {}
 
     def compose(self) -> ComposeResult:
         with Container(id="commit-detail-dialog"):
@@ -1631,7 +1707,11 @@ class CommitDetailScreen(ModalScreen[None]):
                         yield Label("", id="replies-title")
                         yield Static("Loading replies...", id="replies-status")
                         yield RepliesListView(id="commit-replies")
-                yield CommitImageViewer(self.client, id="thread-image-view")
+                yield CommitImageViewer(
+                    self.client,
+                    id="thread-image-view",
+                    image_loader=self._load_commit_image,
+                )
             yield Static(
                 "Ctrl+j/k scroll ancestors · Alt+j/k scroll replying-to · j/k select reply · Enter follow · i images · Ctrl+R reply · u parent · q/Esc back · r retry",
                 id="detail-help",
@@ -1639,12 +1719,21 @@ class CommitDetailScreen(ModalScreen[None]):
 
     def on_mount(self) -> None:
         self._show_current_level()
+        if self.current_level.commit.deleted:
+            status = self.query_one("#replies-status", Static)
+            status.update("This commit was deleted.")
+            status.display = True
+            return
         self.load_more_replies()
-        self.app.run_worker(
-            self._load_commit_context(self.levels[0].commit.id),
-            group=f"commit-context-{self.levels[0].commit.id}",
-            exclusive=True,
-        )
+        if self.initial_detail_loaded:
+            self.initial_detail_loaded = False
+        else:
+            self.app.run_worker(
+                self._load_commit_context(self.levels[0].commit.id),
+                group=f"commit-context-{self.levels[0].commit.id}",
+                exclusive=True,
+            )
+        self._load_quoted_commit(self.current_level)
 
     @property
     def current_level(self) -> CommitThreadLevel:
@@ -1677,7 +1766,8 @@ class CommitDetailScreen(ModalScreen[None]):
         return rendered
 
     def _current_commit_display(self, width: int | None = None) -> Text:
-        commit = self.current_level.commit
+        level = self.current_level
+        commit = level.commit
         return _commit_display(
             commit,
             max(len(commit.body), 1),
@@ -1685,7 +1775,55 @@ class CommitDetailScreen(ModalScreen[None]):
             width=width,
             thread_view=True,
             include_quote_text=True,
+            full_quoted_commit=(
+                level.quoted_commit_detail.commit
+                if level.quoted_commit_detail is not None
+                else None
+            ),
         )
+
+    def _load_quoted_commit(self, level: CommitThreadLevel) -> None:
+        preview = level.commit.quoted_commit
+        if (
+            level.commit.quoted_commit_id is None
+            or preview is None
+            or preview.deleted
+            or level.quoted_commit_detail is not None
+            or level.quoted_commit_loading
+            or level.quoted_commit_failed
+        ):
+            return
+        level.quoted_commit_loading = True
+        self.app.run_worker(
+            self._fetch_quoted_commit(level),
+            group=f"quoted-commit-{level.commit.id}",
+            exclusive=True,
+        )
+
+    async def _fetch_quoted_commit(self, level: CommitThreadLevel) -> None:
+        quoted_commit_id = level.commit.quoted_commit_id
+        if quoted_commit_id is None:
+            return
+        try:
+            detail = await asyncio.to_thread(
+                self.client.get_commit_detail,
+                quoted_commit_id,
+            )
+        except (ApiError, OSError) as error:
+            level.quoted_commit_failed = True
+            if self.is_mounted:
+                self.app.notify(
+                    f"Could not load the full quoted commit: {error}",
+                    severity="warning",
+                )
+        else:
+            if not self.is_mounted:
+                return
+            level.quoted_commit_detail = detail
+        finally:
+            level.quoted_commit_loading = False
+            if self.is_mounted and level is self.current_level:
+                self._show_current_level()
 
     def _scroll_current_commit(self, direction: int) -> None:
         current_pane = self.query_one("#current-commit-pane", VerticalScroll)
@@ -1733,6 +1871,7 @@ class CommitDetailScreen(ModalScreen[None]):
 
     def _show_current_level(self) -> None:
         level = self.current_level
+        self._preload_commit_images(level.commit)
         thread_context_text = self.query_one("#thread-context", LinkedText)
         thread_context_text.update(
             self._thread_display(max(1, thread_context_text.content_region.width))
@@ -1744,7 +1883,9 @@ class CommitDetailScreen(ModalScreen[None]):
             )
         )
         self.query_one("#replies-title", Label).update(
-            f"REPLIES / @{level.commit.username} · {level.commit.replies_count}"
+            "DELETED COMMIT"
+            if level.commit.deleted
+            else f"REPLIES / @{level.commit.username} · {level.commit.replies_count}"
         )
         reply_list = self.query_one("#commit-replies", RepliesListView)
         reply_list.clear()
@@ -1763,6 +1904,65 @@ class CommitDetailScreen(ModalScreen[None]):
             reply_list.index = None
         self._update_reply_status(level)
         reply_list.focus()
+
+    async def _load_commit_image(self, image: ApiCommitImage) -> PILImage.Image:
+        cached = self._image_memory_cache.get(image.url)
+        if cached is not None:
+            self._image_memory_cache.move_to_end(image.url)
+            return cached
+
+        task = self._image_loads.get(image.url)
+        if task is None:
+            task = asyncio.create_task(self._download_commit_image(image))
+            self._image_loads[image.url] = task
+            task.add_done_callback(
+                lambda completed, image_url=image.url: self._discard_image_load(
+                    image_url, completed
+                )
+            )
+        return await asyncio.shield(task)
+
+    async def _download_commit_image(self, image: ApiCommitImage) -> PILImage.Image:
+        contents = await asyncio.to_thread(self.client.get_commit_image, image)
+        preview = await asyncio.to_thread(_decode_commit_image, contents)
+        self._image_memory_cache[image.url] = preview
+        self._image_memory_cache.move_to_end(image.url)
+        while len(self._image_memory_cache) > 6:
+            self._image_memory_cache.popitem(last=False)
+        return preview
+
+    def _discard_image_load(
+        self,
+        image_url: str,
+        task: asyncio.Task[PILImage.Image],
+    ) -> None:
+        if self._image_loads.get(image_url) is task:
+            self._image_loads.pop(image_url, None)
+
+    def _preload_commit_images(self, commit: ApiCommit) -> None:
+        if commit.images:
+            self.app.run_worker(
+                self._preload_images(commit.images),
+                group=f"commit-image-preload-{commit.id}",
+            )
+
+    async def _preload_images(self, images: tuple[ApiCommitImage, ...]) -> None:
+        async def preload(image: ApiCommitImage) -> None:
+            try:
+                await self._load_commit_image(image)
+            except (
+                ApiError,
+                OSError,
+                ValueError,
+                PILImage.DecompressionBombError,
+            ) as error:
+                if self.is_mounted:
+                    self.app.notify(
+                        f"Could not preload attached image: {error}",
+                        severity="warning",
+                    )
+
+        await asyncio.gather(*(preload(image) for image in images))
 
     def _update_reply_status(self, level: CommitThreadLevel) -> None:
         status = self.query_one("#replies-status", Static)
@@ -1872,7 +2072,9 @@ class CommitDetailScreen(ModalScreen[None]):
         if count == 0:
             return
         index = reply_list.index
-        if index is not None and self._scroll_reply_into_view(reply_list, index):
+        if index is not None and _scroll_list_item_into_view(
+            reply_list, index, direction
+        ):
             return
         if index is None:
             index = 0 if direction > 0 else count - 1
@@ -1881,25 +2083,6 @@ class CommitDetailScreen(ModalScreen[None]):
         reply_list.index = index
         reply_list.focus()
         self.current_level.selected_index = index
-
-    @staticmethod
-    def _scroll_reply_into_view(reply_list: RepliesListView, index: int) -> bool:
-        reply = reply_list.children[index]
-        viewport = reply_list.content_region
-        if reply.region.height > viewport.height:
-            return False
-        if reply.region.y < viewport.y:
-            scroll_delta = reply.region.y - viewport.y
-        elif reply.region.bottom > viewport.bottom:
-            scroll_delta = reply.region.bottom - viewport.bottom
-        else:
-            return False
-        reply_list.scroll_to(
-            y=reply_list.scroll_y + scroll_delta,
-            animate=False,
-            force=True,
-        )
-        return True
 
     def action_next_reply(self) -> None:
         if self.image_view_active:
@@ -1964,11 +2147,29 @@ class CommitDetailScreen(ModalScreen[None]):
         )
 
     def _detail_help_text(self) -> str:
+        quote_navigation = (
+            "[bold cyan]o[/] quoted commit · "
+            if self.current_level.quoted_commit_detail is not None
+            else ""
+        )
         return (
             "Ctrl+j/k scroll ancestors · Alt+j/k scroll replying-to · "
             "j/k select reply · Enter follow · "
-            "i images · "
+            f"{quote_navigation}i images · "
             "Ctrl+R reply · u parent · q/Esc back · r retry"
+        )
+
+    def action_open_quoted_commit(self) -> None:
+        detail = self.current_level.quoted_commit_detail
+        if detail is None:
+            self.app.notify("The original quoted commit is unavailable.", severity="information")
+            return
+        self.app.push_screen(
+            CommitDetailScreen(
+                detail.commit,
+                self.client,
+                initial_detail=detail,
+            )
         )
 
     def action_reply_to_current(self) -> None:
@@ -1978,6 +2179,9 @@ class CommitDetailScreen(ModalScreen[None]):
         index = reply_list.index
         if index is not None and 0 <= index < len(level.replies):
             parent = level.replies[index]
+        if parent.deleted:
+            self.app.notify("This reply was deleted.", severity="information")
+            return
         self.app._begin_composition(parent=parent)
 
     async def action_toggle_star_current(self) -> None:
@@ -1987,6 +2191,9 @@ class CommitDetailScreen(ModalScreen[None]):
         index = reply_list.index
         if index is not None and 0 <= index < len(level.replies):
             commit = level.replies[index]
+        if commit.deleted:
+            self.app.notify("This reply was deleted.", severity="information")
+            return
         self.app._queue_commit_star_toggle(commit)
 
     def update_commit(self, commit: ApiCommit) -> None:
@@ -2002,9 +2209,13 @@ class CommitDetailScreen(ModalScreen[None]):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if not isinstance(event.list_view, RepliesListView) or not isinstance(event.item, CommitCard):
             return
+        if event.item.commit.deleted:
+            self.app.notify("This reply was deleted.", severity="information")
+            return
         self.current_level.selected_index = event.index
         self.levels.append(CommitThreadLevel(event.item.commit))
         self._show_current_level()
+        self._load_quoted_commit(self.current_level)
         self.load_more_replies()
 
     def reply_posted(self, parent: ApiCommit) -> None:
@@ -2096,7 +2307,13 @@ def _commit_display(
     width: int | None = None,
     thread_view: bool = False,
     include_quote_text: bool = False,
+    full_quoted_commit: ApiCommit | None = None,
 ) -> Text:
+    if commit.deleted:
+        return Text(
+            "This reply was deleted." if thread_view else "This commit was deleted.",
+            style="dim",
+        )
     body = commit.body.strip()
     if len(body) > body_limit:
         body = f"{body[: body_limit - 3].rstrip()}..."
@@ -2115,7 +2332,13 @@ def _commit_display(
     rendered.append("\n")
     rendered.append(_linkify_urls(body))
     if include_quote_text and has_quoted_commit:
-        _append_inline_quote(rendered, commit.quoted_commit)
+        _append_commit_preview(
+            rendered,
+            "QUOTED COMMIT",
+            full_quoted_commit or commit.quoted_commit,
+            "Original commit is unavailable.",
+            width=max(1, width or 72),
+        )
     if show_counts:
         rendered.append(
             f"\n★ {commit.stars_count}",
@@ -2133,47 +2356,19 @@ def _commit_display(
             commit.quoted_commit,
             "Original commit is unavailable.",
             width=max(1, width or 72),
+            truncate_preview=False,
         )
     return rendered
-
-
-def _append_inline_quote(
-    rendered: Text,
-    preview: ApiCommitPreview | None,
-) -> None:
-    rendered.append("\n\n↳ ", style="bold cyan")
-    if preview is None:
-        rendered.append("Original commit is unavailable.", style="dim")
-        return
-
-    author = preview.author_name or preview.username
-    if author is not None:
-        rendered.append(author, style="bold")
-        if preview.username is not None:
-            rendered.append(f" @{preview.username}", style="dim")
-        rendered.append(": ", style="dim")
-
-    if preview.deleted:
-        body = "This commit was deleted."
-    elif preview.body is None or not preview.body.strip():
-        body = "Commit text is unavailable."
-    else:
-        body = preview.body.strip()
-        if len(body) > 180:
-            body = f"{body[:177].rstrip()}..."
-
-    rendered.append("“", style="dim")
-    rendered.append(_linkify_urls(body))
-    rendered.append("”", style="dim")
 
 
 def _append_commit_preview(
     rendered: Text,
     label: str,
-    preview: ApiCommitPreview | None,
+    preview: ApiCommitPreview | ApiCommit | None,
     unavailable_message: str,
     *,
     width: int,
+    truncate_preview: bool = True,
 ) -> None:
     top_prefix = "╭─ " if width >= 3 else "╭"
     inner_width = max(1, width - cell_len(top_prefix))
@@ -2198,13 +2393,17 @@ def _append_commit_preview(
             if preview.username is not None:
                 author_line.append(f" @{preview.username}", style="dim")
             _append_quoted_line(rendered, author_line, width)
-        if preview.deleted:
+        if isinstance(preview, ApiCommitPreview) and preview.deleted:
             body = "This commit was deleted."
         elif preview.body is None or not preview.body.strip():
             body = "Commit text is unavailable."
         else:
             body = preview.body.strip()
-            if len(body) > 180:
+            if (
+                truncate_preview
+                and isinstance(preview, ApiCommitPreview)
+                and len(body) > 180
+            ):
                 body = f"{body[:177].rstrip()}..."
         for line in body.splitlines() or [body]:
             _append_quoted_line(rendered, _linkify_urls(line), width)
@@ -2300,10 +2499,11 @@ class DevNullApp(App[None]):
     SUB_TITLE = "A social network for developers"
     CSS_PATH = "styles.tcss"
     BINDINGS = [
-        ("h", "previous_journal", "Previous journal"),
+        Binding("1", "log_latest", "Latest log"),
+        Binding("2", "log_following", "Following"),
+        Binding("3", "log_trending", "Trending"),
         ("j", "next_commit", "Next commit"),
         ("k", "previous_commit", "Previous commit"),
-        ("l", "next_journal", "Next journal"),
         ("r", "refresh_log", "Refresh journal"),
         ("s", "toggle_star_selected", "Toggle star"),
         Binding("C", "new_commit", "New commit", key_display="Shift+C"),
@@ -2329,9 +2529,11 @@ class DevNullApp(App[None]):
         )
         self._omarchy_theme_watch_error: str | None = None
         self.authenticated_user: ApiUser | None = None
+        self.optimistic_cached_user: ApiUser | None = None
         self.api_client: SignedApiClient | None = None
         self.pending_authorization: DeviceAuthorization | None = None
         self.active_log: LogName = "latest"
+        self._last_log_shortcut: tuple[LogName, float] | None = None
         self.log_cursors: dict[LogName, str | None] = {
             "following": None,
             "latest": None,
@@ -2342,6 +2544,49 @@ class DevNullApp(App[None]):
             "latest": False,
             "trending": False,
         }
+        self.log_refreshed: dict[LogName, bool] = {
+            "following": False,
+            "latest": False,
+            "trending": False,
+        }
+        self.log_page_sizes: dict[LogName, int] = {
+            "following": LOG_PAGE_SIZE,
+            "latest": LOG_PAGE_SIZE,
+            "trending": LOG_PAGE_SIZE,
+        }
+        self.log_new_commit_counts: dict[LogName, int] = {
+            "following": 0,
+            "latest": 0,
+            "trending": 0,
+        }
+        self.log_new_commit_counts_are_lower_bounds: dict[LogName, bool] = {
+            "following": False,
+            "latest": False,
+            "trending": False,
+        }
+        self.pending_log_refreshes: dict[LogName, tuple[ApiCommit, ...]] = {
+            "following": (),
+            "latest": (),
+            "trending": (),
+        }
+        self.pending_log_refresh_cursors: dict[LogName, str | None] = {
+            "following": None,
+            "latest": None,
+            "trending": None,
+        }
+        self.pending_log_refresh_updates_cursor: dict[LogName, bool] = {
+            "following": False,
+            "latest": False,
+            "trending": False,
+        }
+        self.pending_log_refresh_replaces_log: dict[LogName, bool] = {
+            "following": False,
+            "latest": False,
+            "trending": False,
+        }
+        self.log_cache: CommitLogCache | None = None
+        self.log_cache_entries: dict[LogName, CachedLog] = {}
+        self._log_cache_error: str | None = None
         self.commit_star_toggles: set[str] = set()
         self.log_versions: dict[LogName, int] = {
             "following": 0,
@@ -2353,12 +2598,51 @@ class DevNullApp(App[None]):
             "latest": False,
             "trending": False,
         }
+        self.startup_cached_logs: dict[LogName, tuple[ApiCommit, ...]] = {}
+        self._startup_cache_warning: str | None = None
         self.notification_cursor: str | None = None
         self.notifications_version = 0
         self.notifications_loading = False
+        self._preload_startup_cache()
+
+    def _preload_startup_cache(self) -> None:
+        try:
+            keypair_present = saved_device_identity_files_exist()
+        except OSError as error:
+            self._startup_cache_warning = f"Could not check the saved device key: {error}"
+            return
+        if not keypair_present:
+            return
+        try:
+            cached_user = StartupProfileCache().load()
+        except (OSError, ValueError) as error:
+            self._startup_cache_warning = f"Could not read the cached profile: {error}"
+            return
+        if cached_user is None:
+            return
+
+        self.optimistic_cached_user = cached_user
+        self.log_cache = CommitLogCache(cached_user.username)
+        try:
+            entries = self.log_cache.load()
+        except (OSError, ValueError) as error:
+            self._startup_cache_warning = f"Could not read the local journal cache: {error}"
+            return
+
+        self.log_cache_entries = entries
+        for log_name, entry in entries.items():
+            self.log_page_sizes[log_name] = max(LOG_PAGE_SIZE, entry.page_size)
+            self.log_loaded[log_name] = bool(entry.commits)
+            self.startup_cached_logs[log_name] = entry.commits
+
     def on_mount(self) -> None:
+        self._show_view("latest-view", "LOG / LATEST", "latest-log")
+        self.query_one("#latest-list", JournalListView).focus()
+        if self._startup_cache_warning is not None:
+            self._notify_log_cache_error(self._startup_cache_warning)
         self.set_interval(0.25, self._poll_callback_handoff)
         self.set_interval(0.5, self._check_omarchy_theme)
+        self.set_interval(60, self._auto_refresh_active_log)
         self.run_worker(self._restore_saved_session(), group="session-restore", exclusive=True)
 
     def _check_omarchy_theme(self) -> None:
@@ -2416,9 +2700,19 @@ class DevNullApp(App[None]):
     def _sidebar(self) -> Container:
         return Container(
             Static("[bold cyan]/dev/null[/bold cyan]\n[dim]developer logs[/dim]", id="brand"),
-            Button("Latest log", id="latest-log", variant="primary"),
-            Button("Following", id="following-log"),
-            Button("Trending", id="trending-log"),
+            Button(
+                Text.assemble(("[1] ", "bold cyan"), ("Latest log", "")),
+                id="latest-log",
+                variant="primary",
+            ),
+            Button(
+                Text.assemble(("[2] ", "bold cyan"), ("Following", "")),
+                id="following-log",
+            ),
+            Button(
+                Text.assemble(("[3] ", "bold cyan"), ("Trending", "")),
+                id="trending-log",
+            ),
             Button("Notifications", id="notifications"),
             Button("My profile", id="profile"),
             Static(
@@ -2429,7 +2723,10 @@ class DevNullApp(App[None]):
         )
 
     def _log_view(self, log_name: LogName) -> Container:
-        commits = JournalListView(log_name)
+        commits = JournalListView(
+            log_name,
+            self.startup_cached_logs.get(log_name, ()),
+        )
         status = Static(
             "Sign in to load your /dev/null journals.",
             id=f"{log_name}-status",
@@ -2466,11 +2763,22 @@ class DevNullApp(App[None]):
         complete_button.display = False
         logout_button = Button("Log out", id="logout")
         logout_button.display = False
-        return Container(
-            Static(
+        cached_user = self.optimistic_cached_user
+        profile_content = (
+            f"[bold]@{escape(cached_user.username)}[/bold]\n"
+            f"[dim]{escape(cached_user.name or cached_user.username)}[/dim]\n\n"
+            f"{escape(cached_user.bio or 'No bio set on GitHub.')}\n\n"
+            "[dim]Cached profile; checking the saved device...[/dim]"
+            if cached_user is not None
+            else (
                 "[bold]@guest[/bold]\n[dim]Public visitor[/dim]\n\n"
                 "You are reading /dev/null as a guest.\n"
-                "GitHub identity keeps developer profiles real.",
+                "GitHub identity keeps developer profiles real."
+            )
+        )
+        return Container(
+            Static(
+                profile_content,
                 classes="profile-card",
                 id="profile-card",
             ),
@@ -2491,15 +2799,18 @@ class DevNullApp(App[None]):
     def action_show_trending(self) -> None:
         self._show_log("trending")
 
+    async def action_log_latest(self) -> None:
+        await self._show_log_from_shortcut("latest")
+
+    async def action_log_following(self) -> None:
+        await self._show_log_from_shortcut("following")
+
+    async def action_log_trending(self) -> None:
+        await self._show_log_from_shortcut("trending")
+
     def action_show_notifications(self) -> None:
         self._show_view("notifications-view", "NOTIFICATIONS", "notifications")
         self._start_notifications_load(reset=True)
-
-    def action_previous_journal(self) -> None:
-        self._move_journal(-1)
-
-    def action_next_journal(self) -> None:
-        self._move_journal(1)
 
     def action_next_commit(self) -> None:
         self._move_commit_selection(1)
@@ -2555,19 +2866,194 @@ class DevNullApp(App[None]):
             self.query_one(f"#{button_id}", Button).set_class(is_active, "active")
 
     def _show_log(self, log_name: LogName) -> None:
+        view_id = f"{log_name}-view"
         self.active_log = log_name
         titles = {
             "following": "LOG / FOLLOWING",
             "latest": "LOG / LATEST",
             "trending": "LOG / TRENDING",
         }
-        self._show_view(f"{log_name}-view", titles[log_name], f"{log_name}-log")
+        self._show_view(view_id, titles[log_name], f"{log_name}-log")
+        if self.log_loaded[log_name]:
+            if not self.log_refreshed[log_name]:
+                self._start_log_load(log_name, reset=True)
+            return
         self._start_log_load(log_name, reset=True)
+
+    async def _show_log_from_shortcut(self, log_name: LogName) -> None:
+        now = time.monotonic()
+        previous = self._last_log_shortcut
+        double_pressed = (
+            previous is not None
+            and previous[0] == log_name
+            and now - previous[1] <= _LOG_KEY_DOUBLE_PRESS_SECONDS
+        )
+        self._show_log(log_name)
+        if double_pressed:
+            await self._apply_pending_log_refresh(log_name)
+            self._last_log_shortcut = None
+            self.call_after_refresh(self._scroll_log_to_top, log_name)
+            return
+
+        self._last_log_shortcut = (log_name, now)
+        pending_count = self.log_new_commit_counts[log_name]
+        if pending_count:
+            self._notify_new_log_commits(
+                log_name,
+                pending_count,
+                at_least=self.log_new_commit_counts_are_lower_bounds[log_name],
+            )
+
+    def _stage_log_refresh(
+        self,
+        log_name: LogName,
+        commits: tuple[ApiCommit, ...],
+        commit_list: JournalListView,
+        next_cursor: str | None,
+    ) -> None:
+        visible_ids = {
+            item.commit.id
+            for item in commit_list.children
+            if isinstance(item, CommitCard)
+        }
+        unique_page: list[ApiCommit] = []
+        page_ids: set[str] = set()
+        for commit in commits:
+            if commit.id not in page_ids:
+                page_ids.add(commit.id)
+                unique_page.append(commit)
+
+        page_is_all_new_and_full = (
+            self.log_page_sizes[log_name] >= LOG_PAGE_SIZE
+            and len(unique_page) >= self.log_page_sizes[log_name]
+            and not page_ids.intersection(visible_ids)
+        )
+        prior_pending = self.pending_log_refreshes[log_name]
+        retained_pending = [
+            commit
+            for commit in prior_pending
+            if commit.id not in visible_ids and commit.id not in page_ids
+        ]
+        pending = (
+            tuple(unique_page)
+            if page_is_all_new_and_full
+            else (*unique_page, *retained_pending)
+        )
+        self.pending_log_refreshes[log_name] = pending
+        pending_ids = {
+            commit.id for commit in pending if commit.id not in visible_ids
+        }
+        self.log_new_commit_counts[log_name] = len(pending_ids)
+        self.log_new_commit_counts_are_lower_bounds[log_name] = (
+            page_is_all_new_and_full
+        )
+        self.pending_log_refresh_replaces_log[log_name] = (
+            page_is_all_new_and_full
+        )
+        if self.log_cursors[log_name] is None:
+            self.pending_log_refresh_cursors[log_name] = next_cursor
+            self.pending_log_refresh_updates_cursor[log_name] = True
+        if pending_ids:
+            self._notify_new_log_commits(
+                log_name,
+                len(pending_ids),
+                at_least=page_is_all_new_and_full,
+            )
+
+    async def _apply_pending_log_refresh(self, log_name: LogName) -> None:
+        pending = self.pending_log_refreshes[log_name]
+        if not pending:
+            return
+
+        commit_list = self.query_one(f"#{log_name}-list", JournalListView)
+        original_cards = [
+            item for item in commit_list.children if isinstance(item, CommitCard)
+        ]
+        cards_by_id: dict[str, CommitCard] = {}
+        for card in original_cards:
+            cards_by_id.setdefault(card.commit.id, card)
+
+        ordered_commits: list[ApiCommit] = []
+        seen_ids: set[str] = set()
+        for commit in pending:
+            if commit.id in seen_ids:
+                continue
+            seen_ids.add(commit.id)
+            existing = cards_by_id.get(commit.id)
+            if existing is not None and commit.id in self.commit_star_toggles:
+                ordered_commits.append(existing.commit)
+            else:
+                ordered_commits.append(commit)
+
+        if not self.pending_log_refresh_replaces_log[log_name]:
+            for card in original_cards:
+                if card.commit.id not in seen_ids:
+                    seen_ids.add(card.commit.id)
+                    ordered_commits.append(card.commit)
+
+        current_ids = [card.commit.id for card in original_cards]
+        ordered_ids = [commit.id for commit in ordered_commits]
+        has_updates = any(
+            cards_by_id[commit.id].commit != commit
+            for commit in pending
+            if commit.id in cards_by_id and commit.id not in self.commit_star_toggles
+        )
+        if current_ids != ordered_ids or has_updates:
+            await commit_list.clear()
+            await commit_list.extend(CommitCard(commit) for commit in ordered_commits)
+
+        if self.pending_log_refresh_updates_cursor[log_name]:
+            self.log_cursors[log_name] = self.pending_log_refresh_cursors[log_name]
+        self.pending_log_refreshes[log_name] = ()
+        self.log_new_commit_counts[log_name] = 0
+        self.log_new_commit_counts_are_lower_bounds[log_name] = False
+        self.log_new_commit_counts_are_lower_bounds[log_name] = False
+        self.pending_log_refresh_replaces_log[log_name] = False
+        self.pending_log_refresh_updates_cursor[log_name] = False
+        self.pending_log_refresh_cursors[log_name] = None
+        self._save_log_cache(log_name, tuple(ordered_commits))
 
     def action_refresh_log(self) -> None:
         if self.query_one("#views", ContentSwitcher).current != f"{self.active_log}-view":
             return
-        self._start_log_load(self.active_log, reset=True)
+        self._start_log_load(
+            self.active_log,
+            reset=True,
+            notify_refresh_start=True,
+        )
+
+    def _auto_refresh_active_log(self) -> None:
+        log_name = self.active_log
+        if (
+            self.api_client is None
+            or self.query_one("#views", ContentSwitcher).current != f"{log_name}-view"
+            or not self.log_loaded[log_name]
+        ):
+            return
+        self._start_log_load(log_name, reset=True)
+
+    def _scroll_log_to_top(self, log_name: LogName) -> None:
+        list_view = self.query_one(f"#{log_name}-list", JournalListView)
+        list_view.scroll_to(y=0, animate=False, force=True)
+        list_view.index = 0 if list_view.children else None
+        if list_view.show_vertical_scrollbar:
+            list_view.vertical_scrollbar.position = list_view.scroll_y
+        self.log_new_commit_counts[log_name] = 0
+
+    def _notify_new_log_commits(
+        self,
+        log_name: LogName,
+        count: int,
+        *,
+        at_least: bool = False,
+    ) -> None:
+        key = {"latest": "1", "following": "2", "trending": "3"}[log_name]
+        noun = "commit" if count == 1 else "commits"
+        count_label = f"{count}+" if at_least else str(count)
+        self.notify(
+            f"{count_label} new {noun}. Double press {key} to scroll to top.",
+            title=f"{log_name.title()} log",
+        )
 
     def action_toggle_star_selected(self) -> None:
         if isinstance(self.screen, ModalScreen):
@@ -2688,6 +3174,9 @@ class DevNullApp(App[None]):
             return
         if not isinstance(event.list_view, JournalListView) or not isinstance(event.item, CommitCard):
             return
+        if event.item.commit.deleted:
+            self.notify("This commit was deleted.", severity="information")
+            return
         if self.api_client is None:
             self.notify("Sign in to view commit replies.", severity="warning")
             return
@@ -2697,13 +3186,43 @@ class DevNullApp(App[None]):
         button = self.query_one("#sign-in", Button)
         status = self.query_one("#sign-in-status", Static)
         button.disabled = True
+        cached_user = self.optimistic_cached_user
         try:
             key_path = await asyncio.to_thread(existing_device_identity)
-            if key_path is None:
-                return
-            client = SignedApiClient(key_path)
+        except ApiError as error:
+            if self.optimistic_cached_user is not None:
+                await self._clear_optimistic_cached_display()
+            if error.code == "device_not_approved":
+                status.update(
+                    "[yellow]Saved device is not approved. Sign in again to authorize it.[/yellow]"
+                )
+            else:
+                status.update(
+                    f"[bold red]Could not restore sign-in: {escape(str(error))}[/bold red]"
+                )
+            button.disabled = False
+            return
+        except OSError as error:
+            if self.optimistic_cached_user is not None:
+                await self._clear_optimistic_cached_display()
+            status.update(
+                f"[bold red]Could not restore sign-in: {escape(str(error))}[/bold red]"
+            )
+            button.disabled = False
+            return
+
+        if key_path is None:
+            if self.optimistic_cached_user is not None:
+                await self._clear_optimistic_cached_display()
+            button.disabled = False
+            return
+
+        client = SignedApiClient(key_path)
+        try:
             user = await asyncio.to_thread(client.get_current_user)
         except ApiError as error:
+            if cached_user is not None and self._is_auth_rejection(error):
+                await self._clear_cached_account(cached_user.username)
             if error.code == "device_not_approved":
                 status.update("[yellow]Saved device is not approved. Sign in again to authorize it.[/yellow]")
             else:
@@ -2711,7 +3230,16 @@ class DevNullApp(App[None]):
         except OSError as error:
             status.update(f"[bold red]Could not restore sign-in: {escape(str(error))}[/bold red]")
         else:
+            same_cached_account = (
+                cached_user is not None
+                and cached_user.username.casefold() == user.username.casefold()
+            )
+            if cached_user is not None and not same_cached_account:
+                await self._clear_optimistic_cached_display()
             self._set_authenticated_user(client, user)
+            if not same_cached_account:
+                await self._restore_cached_logs()
+            await self._save_cached_user(user)
             status.update("[bold green]Signed in with the saved device.[/bold green]")
             self._start_log_load(self.active_log, reset=True)
         finally:
@@ -2777,11 +3305,24 @@ class DevNullApp(App[None]):
         try:
             user = await asyncio.to_thread(client.redeem_device, code, authorization.code_verifier)
         except ApiError as error:
+            cached_user = self.optimistic_cached_user
+            if cached_user is not None and self._is_auth_rejection(error):
+                await self._clear_cached_account(cached_user.username)
             status.update(f"[bold red]{escape(str(error))}[/bold red] Start sign-in again to retry.")
         except OSError as error:
             status.update(f"[bold red]Could not complete sign-in: {escape(str(error))}[/bold red]")
         else:
+            cached_user = self.optimistic_cached_user
+            same_cached_account = (
+                cached_user is not None
+                and cached_user.username.casefold() == user.username.casefold()
+            )
+            if cached_user is not None and not same_cached_account:
+                await self._clear_optimistic_cached_display()
             self._set_authenticated_user(client, user)
+            if not same_cached_account:
+                await self._restore_cached_logs()
+            await self._save_cached_user(user)
             self.query_one("#auth-callback", Input).display = False
             complete_button.display = False
             status.update("[bold green]Signed in.[/bold green]")
@@ -2791,8 +3332,18 @@ class DevNullApp(App[None]):
             complete_button.disabled = False
 
     def _set_authenticated_user(self, client: SignedApiClient, user: ApiUser) -> None:
+        cached_user = self.optimistic_cached_user
+        keep_cached_logs = (
+            cached_user is not None
+            and cached_user.username.casefold() == user.username.casefold()
+        )
         self.api_client = client
         self.authenticated_user = user
+        self.optimistic_cached_user = None
+        self.log_cache = CommitLogCache(user.username)
+        if not keep_cached_logs:
+            self.log_cache_entries = {}
+        self._log_cache_error = None
         self.query_one("#profile-card", Static).update(
             f"[bold]@{escape(user.username)}[/bold]\n[dim]{escape(user.name or user.username)}[/dim]\n\n"
             f"{escape(user.bio or 'No bio set on GitHub.')}\n\n"
@@ -2804,6 +3355,91 @@ class DevNullApp(App[None]):
             self.query_one("#view-title", Label).update(
                 f"PROFILE / @{escape(user.username)}"
             )
+
+    async def _save_cached_user(self, user: ApiUser) -> None:
+        try:
+            await asyncio.to_thread(StartupProfileCache().save, user)
+        except OSError as error:
+            self._notify_log_cache_error(f"Could not save the cached profile: {error}")
+
+    @staticmethod
+    def _is_auth_rejection(error: ApiError) -> bool:
+        return error.code == "device_not_approved" or error.http_status in {401, 403}
+
+    async def _clear_optimistic_cached_display(self) -> None:
+        self.optimistic_cached_user = None
+        self.log_cache = None
+        self.log_cache_entries = {}
+        self.startup_cached_logs.clear()
+        for log_name in ("following", "latest", "trending"):
+            await self.query_one(f"#{log_name}-list", JournalListView).clear()
+            self.log_cursors[log_name] = None
+            self.log_loaded[log_name] = False
+            self.log_refreshed[log_name] = False
+            self.log_page_sizes[log_name] = LOG_PAGE_SIZE
+            self.log_new_commit_counts[log_name] = 0
+            self.log_new_commit_counts_are_lower_bounds[log_name] = False
+            self.pending_log_refreshes[log_name] = ()
+            self.pending_log_refresh_cursors[log_name] = None
+            self.pending_log_refresh_updates_cursor[log_name] = False
+            self.pending_log_refresh_replaces_log[log_name] = False
+            self.log_versions[log_name] += 1
+            self.log_loading[log_name] = False
+        self.query_one("#profile-card", Static).update(
+            "[bold]@guest[/bold]\n[dim]Public visitor[/dim]\n\n"
+            "You are reading /dev/null as a guest.\n"
+            "GitHub identity keeps developer profiles real."
+        )
+
+    async def _clear_cached_account(self, username: str) -> None:
+        try:
+            await asyncio.to_thread(
+                StartupProfileCache().clear_for_user,
+                username,
+            )
+        except OSError as error:
+            self._notify_log_cache_error(f"Could not clear the rejected account cache: {error}")
+        await self._clear_optimistic_cached_display()
+
+    async def _restore_cached_logs(self) -> None:
+        cache = self.log_cache
+        if cache is None:
+            return
+        try:
+            entries = await asyncio.to_thread(cache.load)
+        except (OSError, ValueError) as error:
+            self._notify_log_cache_error(f"Could not read the local journal cache: {error}")
+            entries = {}
+        self.log_cache_entries = entries
+        for log_name, entry in entries.items():
+            self.log_page_sizes[log_name] = max(LOG_PAGE_SIZE, entry.page_size)
+            self.log_loaded[log_name] = bool(entry.commits)
+            commit_list = self.query_one(f"#{log_name}-list", JournalListView)
+            await commit_list.extend(CommitCard(commit) for commit in entry.commits)
+
+    def _save_log_cache(
+        self,
+        log_name: LogName,
+        commits: tuple[ApiCommit, ...],
+    ) -> None:
+        cache = self.log_cache
+        if cache is None:
+            return
+        try:
+            cache.save_log(
+                self.log_cache_entries,
+                log_name,
+                commits,
+                self.log_page_sizes[log_name],
+            )
+        except (OSError, ValueError) as error:
+            self._notify_log_cache_error(f"Could not save the local journal cache: {error}")
+
+    def _notify_log_cache_error(self, message: str) -> None:
+        if message == self._log_cache_error:
+            return
+        self._log_cache_error = message
+        self.notify(message, severity="warning")
 
     async def _logout(self) -> None:
         status = self.query_one("#sign-in-status", Static)
@@ -2818,8 +3454,10 @@ class DevNullApp(App[None]):
             status.update(f"[bold red]Could not log out: {escape(str(error))}[/bold red]")
         else:
             self.authenticated_user = None
+            self.optimistic_cached_user = None
             self.api_client = None
             self.pending_authorization = None
+            self.startup_cached_logs.clear()
             self.query_one("#profile-card", Static).update(
                 "[bold]@guest[/bold]\n[dim]Public visitor[/dim]\n\n"
                 "You are reading /dev/null as a guest.\n"
@@ -2844,8 +3482,18 @@ class DevNullApp(App[None]):
                 self.query_one(f"#{log_name}-status", Static).display = False
                 self.log_cursors[log_name] = None
                 self.log_loaded[log_name] = False
+                self.log_refreshed[log_name] = False
+                self.log_page_sizes[log_name] = LOG_PAGE_SIZE
+                self.log_new_commit_counts[log_name] = 0
+                self.log_new_commit_counts_are_lower_bounds[log_name] = False
+                self.pending_log_refreshes[log_name] = ()
+                self.pending_log_refresh_cursors[log_name] = None
+                self.pending_log_refresh_updates_cursor[log_name] = False
+                self.pending_log_refresh_replaces_log[log_name] = False
                 self.log_versions[log_name] += 1
                 self.log_loading[log_name] = False
+            self.log_cache = None
+            self.log_cache_entries = {}
             self._show_view("profile", "PROFILE / GUEST", "profile")
             status.update(
                 "[yellow]Signed out locally. Revoke this device in /settings/devices "
@@ -2853,14 +3501,6 @@ class DevNullApp(App[None]):
             )
         finally:
             button.disabled = False
-
-    def _move_journal(self, direction: int) -> None:
-        if self.query_one("#views", ContentSwitcher).current == "profile":
-            return
-        journals: tuple[LogName, ...] = ("latest", "following", "trending")
-        current = journals.index(self.active_log)
-        target = (current + direction) % len(journals)
-        self._show_log(journals[target])
 
     def _move_commit_selection(self, direction: int) -> None:
         current_view = self.query_one("#views", ContentSwitcher).current
@@ -2884,6 +3524,12 @@ class DevNullApp(App[None]):
         if count == 0:
             return
         index = list_view.index
+        if index is not None and _scroll_list_item_into_view(
+            list_view,
+            index,
+            direction,
+        ):
+            return
         if index is None:
             index = 0 if direction > 0 else count - 1
         else:
@@ -2947,6 +3593,9 @@ class DevNullApp(App[None]):
         selected = list_view.children[index]
         if not isinstance(selected, CommitCard):
             self.notify("Select a commit before replying or quoting it.", severity="warning")
+            return None
+        if selected.commit.deleted:
+            self.notify("This commit was deleted.", severity="information")
             return None
         return selected.commit
 
@@ -3015,7 +3664,13 @@ class DevNullApp(App[None]):
             if button.is_mounted:
                 button.disabled = False
 
-    def _start_log_load(self, log_name: LogName, reset: bool) -> None:
+    def _start_log_load(
+        self,
+        log_name: LogName,
+        reset: bool,
+        *,
+        notify_refresh_start: bool = False,
+    ) -> None:
         status = self.query_one(f"#{log_name}-status", Static)
         if self.api_client is None:
             status.display = True
@@ -3025,6 +3680,10 @@ class DevNullApp(App[None]):
             return
         if not reset and self.log_cursors[log_name] is None:
             return
+        if notify_refresh_start and self.log_loaded[log_name]:
+            self.notify("Refreshing...", title=f"{log_name.title()} log")
+        elif not reset:
+            self.notify("Loading more commits...", title=f"{log_name.title()} log")
         cursor = None if reset else self.log_cursors[log_name]
         self.log_versions[log_name] += 1
         version = self.log_versions[log_name]
@@ -3047,7 +3706,6 @@ class DevNullApp(App[None]):
             return
         status = self.query_one(f"#{log_name}-status", Static)
         commit_list = self.query_one(f"#{log_name}-list", ListView)
-        status.display = False
         try:
             log = await asyncio.to_thread(client.get_log, log_name, cursor)
         except ApiError as error:
@@ -3061,17 +3719,69 @@ class DevNullApp(App[None]):
         else:
             if version != self.log_versions[log_name] or not self.is_running:
                 return
-            if reset:
-                commit_list.clear()
-            cards = [CommitCard(commit) for commit in log.commits]
-            commit_list.extend(cards)
-            self.log_cursors[log_name] = log.next_cursor
+            is_refresh = reset and self.log_loaded[log_name]
+            if is_refresh:
+                self.log_page_sizes[log_name] = max(
+                    self.log_page_sizes[log_name],
+                    len(log.commits),
+                )
+                self._stage_log_refresh(
+                    log_name,
+                    log.commits,
+                    commit_list,
+                    log.next_cursor,
+                )
+            else:
+                if reset:
+                    self.log_page_sizes[log_name] = max(
+                        self.log_page_sizes[log_name],
+                        len(log.commits),
+                    )
+                original_cards = [
+                    child
+                    for child in commit_list.children
+                    if isinstance(child, CommitCard)
+                ]
+                cards_by_id: dict[str, CommitCard] = {}
+                for card in original_cards:
+                    cards_by_id.setdefault(card.commit.id, card)
+
+                new_commits: list[ApiCommit] = []
+                seen_ids = set(cards_by_id)
+                for commit in log.commits:
+                    existing_card = cards_by_id.get(commit.id)
+                    if existing_card is not None:
+                        if commit.id not in self.commit_star_toggles:
+                            existing_card.update_commit(commit)
+                    elif commit.id not in seen_ids:
+                        new_commits.append(commit)
+                        seen_ids.add(commit.id)
+
+                if new_commits:
+                    await commit_list.extend(
+                        CommitCard(commit) for commit in new_commits
+                    )
+
+            if not reset or not is_refresh:
+                self.log_cursors[log_name] = log.next_cursor
             self.log_loaded[log_name] = True
-            if not cards and log.suggestions:
+            self.log_refreshed[log_name] = True
+            if is_refresh:
+                self._save_log_cache(log_name, log.commits)
+            else:
+                self._save_log_cache(
+                    log_name,
+                    tuple(
+                        card.commit
+                        for card in commit_list.children
+                        if isinstance(card, CommitCard)
+                    ),
+                )
+            if not commit_list.children and log.suggestions:
                 names = ", ".join(f"@{user.username}" for user in log.suggestions)
                 status.display = True
                 status.update(f"No commits in Following yet. Suggested developers: {escape(names)}")
-            elif not cards:
+            elif not commit_list.children:
                 status.display = True
                 status.update("No commits in this journal yet.")
             else:
