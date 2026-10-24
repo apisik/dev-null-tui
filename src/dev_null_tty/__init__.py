@@ -1066,6 +1066,11 @@ class JournalListView(ListView):
 
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         super().watch_scroll_y(old_value, new_value)
+        if self.is_mounted and old_value > 0 and new_value <= 0:
+            self.app.call_after_refresh(
+                self.app._on_journal_scroll_top,
+                self.log_name,
+            )
         if self.is_mounted and self.is_vertical_scroll_end:
             self.app.call_after_refresh(
                 self.app._on_journal_scroll_end,
@@ -1119,6 +1124,8 @@ def _scroll_list_item_into_view(
 class NotificationsListView(ListView):
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         super().watch_scroll_y(old_value, new_value)
+        if self.is_mounted and old_value > 0 and new_value <= 0:
+            self.app.call_after_refresh(self.app._on_notifications_scroll_top)
         if self.is_mounted and self.is_vertical_scroll_end:
             self.app.call_after_refresh(self.app._on_notifications_scroll_end)
 
@@ -2585,25 +2592,17 @@ class DevNullApp(App[None]):
             "latest": False,
             "trending": False,
         }
-        self.pending_log_refreshes: dict[LogName, tuple[ApiCommit, ...]] = {
-            "following": (),
-            "latest": (),
-            "trending": (),
+        self.pending_log_refresh_pages: dict[
+            LogName, tuple[ApiCommit, ...] | None
+        ] = {
+            "following": None,
+            "latest": None,
+            "trending": None,
         }
         self.pending_log_refresh_cursors: dict[LogName, str | None] = {
             "following": None,
             "latest": None,
             "trending": None,
-        }
-        self.pending_log_refresh_updates_cursor: dict[LogName, bool] = {
-            "following": False,
-            "latest": False,
-            "trending": False,
-        }
-        self.pending_log_refresh_replaces_log: dict[LogName, bool] = {
-            "following": False,
-            "latest": False,
-            "trending": False,
         }
         self.log_cache: CommitLogCache | None = None
         self.log_cache_entries: dict[LogName, CachedLog] = {}
@@ -2630,6 +2629,10 @@ class DevNullApp(App[None]):
         self.cached_notifications: CachedNotifications | None = None
         self.notification_cursor: str | None = None
         self.notification_read_at: str | None = None
+        self.pending_notifications_page: tuple[ApiNotification, ...] | None = None
+        self.pending_notifications_cursor: str | None = None
+        self.pending_notifications_read_at: str | None = None
+        self.notification_page_swap_loading = False
         self.notifications_version = 0
         self.notifications_loading = False
         self.notification_quote_previews: dict[str, ApiCommitPreview] = {}
@@ -2975,95 +2978,59 @@ class DevNullApp(App[None]):
                 page_ids.add(commit.id)
                 unique_page.append(commit)
 
-        page_is_all_new_and_full = (
+        page_is_full_and_all_new = (
             self.log_page_sizes[log_name] >= LOG_PAGE_SIZE
             and len(unique_page) >= self.log_page_sizes[log_name]
             and not page_ids.intersection(visible_ids)
         )
-        prior_pending = self.pending_log_refreshes[log_name]
-        retained_pending = [
-            commit
-            for commit in prior_pending
-            if commit.id not in visible_ids and commit.id not in page_ids
-        ]
-        pending = (
-            tuple(unique_page)
-            if page_is_all_new_and_full
-            else (*unique_page, *retained_pending)
-        )
-        self.pending_log_refreshes[log_name] = pending
-        pending_ids = {
-            commit.id for commit in pending if commit.id not in visible_ids
-        }
-        self.log_new_commit_counts[log_name] = len(pending_ids)
+        self.pending_log_refresh_pages[log_name] = tuple(unique_page)
+        self.pending_log_refresh_cursors[log_name] = next_cursor
+        new_commit_count = len(page_ids - visible_ids)
+        self.log_new_commit_counts[log_name] = new_commit_count
         self.log_new_commit_counts_are_lower_bounds[log_name] = (
-            page_is_all_new_and_full
+            page_is_full_and_all_new
         )
-        self.pending_log_refresh_replaces_log[log_name] = (
-            page_is_all_new_and_full
-        )
-        if self.log_cursors[log_name] is None:
-            self.pending_log_refresh_cursors[log_name] = next_cursor
-            self.pending_log_refresh_updates_cursor[log_name] = True
-        if pending_ids:
+        if new_commit_count:
             self._notify_new_log_commits(
                 log_name,
-                len(pending_ids),
-                at_least=page_is_all_new_and_full,
+                new_commit_count,
+                at_least=page_is_full_and_all_new,
             )
 
     async def _apply_pending_log_refresh(self, log_name: LogName) -> None:
-        pending = self.pending_log_refreshes[log_name]
-        if not pending:
+        pending_page = self.pending_log_refresh_pages[log_name]
+        if pending_page is None:
             return
 
+        pending_cursor = self.pending_log_refresh_cursors[log_name]
+        self.pending_log_refresh_pages[log_name] = None
+        self.pending_log_refresh_cursors[log_name] = None
         commit_list = self.query_one(f"#{log_name}-list", JournalListView)
-        original_cards = [
-            item for item in commit_list.children if isinstance(item, CommitCard)
-        ]
-        cards_by_id: dict[str, CommitCard] = {}
-        for card in original_cards:
-            cards_by_id.setdefault(card.commit.id, card)
-
-        ordered_commits: list[ApiCommit] = []
-        seen_ids: set[str] = set()
-        for commit in pending:
-            if commit.id in seen_ids:
-                continue
-            seen_ids.add(commit.id)
-            existing = cards_by_id.get(commit.id)
-            if existing is not None and commit.id in self.commit_star_toggles:
-                ordered_commits.append(existing.commit)
-            else:
-                ordered_commits.append(commit)
-
-        if not self.pending_log_refresh_replaces_log[log_name]:
-            for card in original_cards:
-                if card.commit.id not in seen_ids:
-                    seen_ids.add(card.commit.id)
-                    ordered_commits.append(card.commit)
-
-        current_ids = [card.commit.id for card in original_cards]
-        ordered_ids = [commit.id for commit in ordered_commits]
-        has_updates = any(
-            cards_by_id[commit.id].commit != commit
-            for commit in pending
-            if commit.id in cards_by_id and commit.id not in self.commit_star_toggles
-        )
-        if current_ids != ordered_ids or has_updates:
-            await commit_list.clear()
-            await commit_list.extend(CommitCard(commit) for commit in ordered_commits)
-
-        if self.pending_log_refresh_updates_cursor[log_name]:
-            self.log_cursors[log_name] = self.pending_log_refresh_cursors[log_name]
-        self.pending_log_refreshes[log_name] = ()
+        await commit_list.clear()
+        await commit_list.extend(CommitCard(commit) for commit in pending_page)
+        self._scroll_log_to_top(log_name)
+        self.log_cursors[log_name] = pending_cursor
         self.log_new_commit_counts[log_name] = 0
         self.log_new_commit_counts_are_lower_bounds[log_name] = False
-        self.log_new_commit_counts_are_lower_bounds[log_name] = False
-        self.pending_log_refresh_replaces_log[log_name] = False
-        self.pending_log_refresh_updates_cursor[log_name] = False
-        self.pending_log_refresh_cursors[log_name] = None
-        self._save_log_cache(log_name, tuple(ordered_commits))
+        status = self.query_one(f"#{log_name}-status", Static)
+        if pending_page:
+            status.display = False
+        else:
+            status.display = True
+            status.update("No commits in this journal yet.")
+        self._save_log_cache(log_name, pending_page)
+
+    def _on_journal_scroll_top(self, log_name: LogName) -> None:
+        if (
+            self.query_one("#views", ContentSwitcher).current != f"{log_name}-view"
+            or self.pending_log_refresh_pages[log_name] is None
+        ):
+            return
+        self.run_worker(
+            self._apply_pending_log_refresh(log_name),
+            group=f"log-refresh-swap-{log_name}",
+            exclusive=True,
+        )
 
     def action_refresh_log(self) -> None:
         if self.query_one("#views", ContentSwitcher).current != f"{self.active_log}-view":
@@ -3103,7 +3070,7 @@ class DevNullApp(App[None]):
         noun = "commit" if count == 1 else "commits"
         count_label = f"{count}+" if at_least else str(count)
         self.notify(
-            f"{count_label} new {noun}. Double press {key} to scroll to top.",
+            f"{count_label} new {noun}. Double press {key} to show the newest page.",
             title=f"{log_name.title()} log",
         )
 
@@ -3407,6 +3374,10 @@ class DevNullApp(App[None]):
             self.query_one("#notifications-list", NotificationsListView).clear()
             self.notification_cursor = None
             self.notification_read_at = None
+            self.pending_notifications_page = None
+            self.pending_notifications_cursor = None
+            self.pending_notifications_read_at = None
+            self.notification_page_swap_loading = False
             try:
                 self.cached_notifications = self.notification_cache.load()
             except (OSError, ValueError) as error:
@@ -3446,6 +3417,10 @@ class DevNullApp(App[None]):
         self.query_one("#notifications-list", NotificationsListView).clear()
         self.notification_cursor = None
         self.notification_read_at = None
+        self.pending_notifications_page = None
+        self.pending_notifications_cursor = None
+        self.pending_notifications_read_at = None
+        self.notification_page_swap_loading = False
         self.notifications_version += 1
         self.notifications_loading = False
         self._clear_notification_quote_cache()
@@ -3457,10 +3432,8 @@ class DevNullApp(App[None]):
             self.log_page_sizes[log_name] = LOG_PAGE_SIZE
             self.log_new_commit_counts[log_name] = 0
             self.log_new_commit_counts_are_lower_bounds[log_name] = False
-            self.pending_log_refreshes[log_name] = ()
+            self.pending_log_refresh_pages[log_name] = None
             self.pending_log_refresh_cursors[log_name] = None
-            self.pending_log_refresh_updates_cursor[log_name] = False
-            self.pending_log_refresh_replaces_log[log_name] = False
             self.log_versions[log_name] += 1
             self.log_loading[log_name] = False
             self._log_reset_started_at[log_name] = None
@@ -3566,6 +3539,10 @@ class DevNullApp(App[None]):
             notifications_status.display = False
             self.notification_cursor = None
             self.notification_read_at = None
+            self.pending_notifications_page = None
+            self.pending_notifications_cursor = None
+            self.pending_notifications_read_at = None
+            self.notification_page_swap_loading = False
             self.notifications_version += 1
             self.notifications_loading = False
             for log_name in ("following", "latest", "trending"):
@@ -3580,10 +3557,8 @@ class DevNullApp(App[None]):
                 self.log_page_sizes[log_name] = LOG_PAGE_SIZE
                 self.log_new_commit_counts[log_name] = 0
                 self.log_new_commit_counts_are_lower_bounds[log_name] = False
-                self.pending_log_refreshes[log_name] = ()
+                self.pending_log_refresh_pages[log_name] = None
                 self.pending_log_refresh_cursors[log_name] = None
-                self.pending_log_refresh_updates_cursor[log_name] = False
-                self.pending_log_refresh_replaces_log[log_name] = False
                 self.log_versions[log_name] += 1
                 self.log_loading[log_name] = False
                 self._log_reset_started_at[log_name] = None
@@ -3927,7 +3902,6 @@ class DevNullApp(App[None]):
         if not reset and self.notification_cursor is None:
             return
         if reset:
-            self.notification_cursor = None
             self.notification_quote_failures.clear()
         if reset:
             self.notify(
@@ -3942,9 +3916,10 @@ class DevNullApp(App[None]):
         version = self.notifications_version
         self.notifications_loading = True
         status.display = False
+        cursor = None if reset else self.notification_cursor
         self.run_worker(
             self._load_notifications_page(
-                self.notification_cursor,
+                cursor,
                 reset,
                 version,
             ),
@@ -3975,35 +3950,153 @@ class DevNullApp(App[None]):
             if version != self.notifications_version or not self.is_running:
                 return
             if reset:
-                await notification_list.clear()
-            existing_ids = {
-                item.notification.id
-                for item in notification_list.children
-                if isinstance(item, NotificationCard)
-            }
-            cards: list[NotificationCard] = []
-            for notification in page.notifications:
-                if notification.id in existing_ids:
-                    continue
-                existing_ids.add(notification.id)
-                cards.append(NotificationCard(notification))
-            await notification_list.extend(cards)
-            for card in cards:
-                self._load_notification_quote_if_missing(card)
-            self.notification_cursor = page.next_cursor
-            self.notification_read_at = page.read_at
-            if reset:
+                current_ids = {
+                    item.notification.id
+                    for item in notification_list.children
+                    if isinstance(item, NotificationCard)
+                }
+                page_ids = {notification.id for notification in page.notifications}
+                new_count = len(page_ids - current_ids)
+                should_stage = bool(notification_list.children) and (
+                    notification_list.scroll_y > 0
+                )
+                if new_count:
+                    full_page_is_all_new = (
+                        len(page.notifications) >= NotificationCache.PAGE_SIZE
+                        and len(page_ids) >= NotificationCache.PAGE_SIZE
+                        and not current_ids.intersection(page_ids)
+                    )
+                    count_label = f"{new_count}+" if full_page_is_all_new else str(new_count)
+                    noun = "notification" if new_count == 1 else "notifications"
+                    suffix = " Scroll to the top to show them." if should_stage else ""
+                    self.notify(
+                        f"{count_label} new {noun}.{suffix}",
+                        title="Notifications",
+                    )
+                if should_stage:
+                    self.pending_notifications_page = page.notifications
+                    self.pending_notifications_cursor = page.next_cursor
+                    self.pending_notifications_read_at = page.read_at
+                    self.notification_read_at = page.read_at
+                    status.display = False
+                    await self._save_notification_cache(page.notifications)
+                    return
+                self.pending_notifications_page = None
+                self.pending_notifications_cursor = None
+                self.pending_notifications_read_at = None
+                await self._replace_notifications_page(
+                    page.notifications,
+                    page.next_cursor,
+                    page.read_at,
+                    version,
+                    prefill=False,
+                )
                 await self._save_notification_cache(page.notifications)
-            if not notification_list.children and page.next_cursor is None:
-                status.display = True
-                status.update("No notifications yet.")
+                if page.next_cursor is not None:
+                    self.call_after_refresh(
+                        self._prefill_notifications_if_needed,
+                        version,
+                    )
             else:
-                status.display = False
-            if page.next_cursor is not None:
-                self.call_after_refresh(self._prefill_notifications_if_needed, version)
+                existing_ids = {
+                    item.notification.id
+                    for item in notification_list.children
+                    if isinstance(item, NotificationCard)
+                }
+                cards: list[NotificationCard] = []
+                for notification in page.notifications:
+                    if notification.id in existing_ids:
+                        continue
+                    existing_ids.add(notification.id)
+                    cards.append(NotificationCard(notification))
+                await notification_list.extend(cards)
+                for card in cards:
+                    self._load_notification_quote_if_missing(card)
+                self.notification_cursor = page.next_cursor
+                self.notification_read_at = page.read_at
+                if not notification_list.children and page.next_cursor is None:
+                    status.display = True
+                    status.update("No notifications yet.")
+                else:
+                    status.display = False
+                if page.next_cursor is not None:
+                    self.call_after_refresh(
+                        self._prefill_notifications_if_needed,
+                        version,
+                    )
         finally:
             if version == self.notifications_version:
                 self.notifications_loading = False
+
+    async def _replace_notifications_page(
+        self,
+        notifications: tuple[ApiNotification, ...],
+        cursor: str | None,
+        read_at: str | None,
+        version: int,
+        *,
+        prefill: bool = True,
+    ) -> None:
+        notification_list = self.query_one(
+            "#notifications-list", NotificationsListView
+        )
+        await notification_list.clear()
+        cards: list[NotificationCard] = []
+        seen_ids: set[str] = set()
+        for notification in notifications:
+            if notification.id in seen_ids:
+                continue
+            seen_ids.add(notification.id)
+            cards.append(NotificationCard(notification))
+        await notification_list.extend(cards)
+        notification_list.scroll_to(y=0, animate=False, force=True)
+        notification_list.index = 0 if notification_list.children else None
+        for card in cards:
+            self._load_notification_quote_if_missing(card)
+        self.notification_cursor = cursor
+        self.notification_read_at = read_at
+        status = self.query_one("#notifications-status", Static)
+        if not notification_list.children and cursor is None:
+            status.display = True
+            status.update("No notifications yet.")
+        else:
+            status.display = False
+        if cursor is not None and prefill:
+            self.call_after_refresh(self._prefill_notifications_if_needed, version)
+
+    def _on_notifications_scroll_top(self) -> None:
+        if (
+            self.query_one("#views", ContentSwitcher).current != "notifications-view"
+            or self.pending_notifications_page is None
+            or self.notification_page_swap_loading
+        ):
+            return
+        self.notification_page_swap_loading = True
+        self.run_worker(
+            self._apply_pending_notifications_page(),
+            group="notifications-page-swap",
+            exclusive=True,
+        )
+
+    async def _apply_pending_notifications_page(self) -> None:
+        notifications = self.pending_notifications_page
+        if notifications is None:
+            self.notification_page_swap_loading = False
+            return
+        cursor = self.pending_notifications_cursor
+        read_at = self.pending_notifications_read_at
+        self.pending_notifications_page = None
+        self.pending_notifications_cursor = None
+        self.pending_notifications_read_at = None
+        try:
+            await self._replace_notifications_page(
+                notifications,
+                cursor,
+                read_at,
+                self.notifications_version,
+            )
+        finally:
+            self.notification_page_swap_loading = False
 
     def _load_notification_quote_if_missing(self, card: NotificationCard) -> None:
         notification_commit = card.notification.commit
@@ -4146,6 +4239,8 @@ class DevNullApp(App[None]):
 
     def _on_notifications_scroll_end(self) -> None:
         if self.query_one("#views", ContentSwitcher).current != "notifications-view":
+            return
+        if self.pending_notifications_page is not None:
             return
         self._start_notifications_load(reset=False)
 

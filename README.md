@@ -172,7 +172,10 @@ Keyboard shortcuts:
 
 Journal navigation wraps between Latest, Following, and Trending. Loaded
 journals remain visible when you switch away and refresh as soon as you return
-to them.
+to them. Refreshes stage the API's new first page instead of merging it into
+the visible entries. Double-press that journal's number or scroll to the top
+to replace the log with the staged page. For notifications, scroll back to the
+top to show the staged page.
 
 ## Test
 

@@ -875,7 +875,7 @@ async def test_r_refreshes_active_journal(monkeypatch) -> None:
         assert journal.index == 8
         assert journal.children[journal.index].commit.id == selected_id
         assert app.log_new_commit_counts["latest"] == 1
-        assert "1 new commit. Double press 1 to scroll to top." in notifications[-1]
+        assert "1 new commit. Double press 1 to show the newest page." in notifications[-1]
         restored_anchor = next(
             item for item in journal.children if item.commit.id == anchor_id
         )
@@ -884,13 +884,7 @@ async def test_r_refreshes_active_journal(monkeypatch) -> None:
         await pilot.press("1", "1")
         await pilot.pause()
         refreshed_ids = [card.commit.id for card in journal.children]
-        expected_ids = [
-            "latest-13",
-            "latest-9",
-            "latest-8",
-            *[f"latest-{index}" for index in range(1, 8)],
-            *[f"latest-{index}" for index in range(10, 13)],
-        ]
+        expected_ids = ["latest-13", "latest-9", "latest-8"]
         assert refreshed_ids == expected_ids
         assert refreshed_ids.count(selected_id) == 1
         assert all(
@@ -951,7 +945,6 @@ async def test_auto_refresh_fetches_the_active_journal() -> None:
         await pilot.pause()
         assert [card.commit.id for card in app.query_one("#latest-list").children] == [
             "latest-2",
-            "latest-1",
         ]
 
 
@@ -1281,6 +1274,90 @@ async def test_cached_notifications_render_before_refresh_finishes(
         assert cached is not None
         assert [item.id for item in cached.notifications] == ["server-notification"]
         assert cached.read_at == "new-read-marker"
+
+
+@pytest.mark.asyncio
+async def test_notification_refresh_replaces_page_when_scrolled_to_top(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+
+    def make_page(prefix: str) -> tuple[ApiNotification, ...]:
+        return tuple(
+            ApiNotification(
+                f"{prefix}-{index}",
+                "starred",
+                "2026-10-20T18:00:00Z",
+                ApiUser("octocat", "The Octocat", None, None),
+                1,
+                1,
+                0,
+                None,
+                None,
+            )
+            for index in range(20)
+        )
+
+    old_page = make_page("old")
+    new_page = make_page("new")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_notifications(self, cursor=None) -> ApiNotifications:
+            assert cursor is None
+            self.calls += 1
+            page = old_page if self.calls == 1 else new_page
+            return ApiNotifications(page, None, "2026-10-20T18:00:00Z")
+
+    app = DevNullApp()
+    client = FakeClient()
+    toasts: list[str] = []
+    app.notify = lambda message, **kwargs: toasts.append(str(message))
+
+    async with app.run_test(size=(120, 20)) as pilot:
+        app._set_authenticated_user(
+            client,
+            ApiUser("reader", "Reader", None, None),
+        )
+        app.action_show_notifications()
+        for _ in range(40):
+            if client.calls == 1 and not app.notifications_loading:
+                break
+            await pilot.pause(0.05)
+
+        notification_list = app.query_one("#notifications-list")
+        old_ids = [item.notification.id for item in notification_list.children]
+        assert old_ids == [item.id for item in old_page]
+        assert notification_list.max_scroll_y > 0
+
+        notification_list.scroll_to(
+            y=notification_list.max_scroll_y,
+            animate=False,
+            force=True,
+        )
+        await pilot.pause()
+        app._start_notifications_load(reset=True)
+        for _ in range(40):
+            if client.calls == 2 and not app.notifications_loading:
+                break
+            await pilot.pause(0.05)
+
+        assert [item.notification.id for item in notification_list.children] == old_ids
+        assert app.pending_notifications_page == new_page
+        assert "20+ new notifications. Scroll to the top to show them." in toasts[-1]
+
+        notification_list.scroll_to(y=0, animate=False, force=True)
+        for _ in range(40):
+            if app.pending_notifications_page is None:
+                break
+            await pilot.pause(0.05)
+
+        assert [item.notification.id for item in notification_list.children] == [
+            item.id for item in new_page
+        ]
 
 
 @pytest.mark.asyncio
