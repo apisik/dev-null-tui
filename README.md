@@ -12,7 +12,8 @@ it into view before changing selection; oversized commits scroll through before
 advancing. Guest users can view the profile
 and sign in; journals require an approved device. Signed-in
 users can browse a cursor-paginated notifications inbox, publish commits,
-reply to a commit, or quote it. Opening the notifications inbox marks
+reply to a commit, or quote it. Quoted commits in notifications show their full
+text when the signed-in user can access them. Opening the notifications inbox marks
 notifications read on /dev/null. Click detected
 HTTP(S) links with the mouse to open them in your default browser. The modal
 composer shows the original commit above the editor for replies and quotes,
@@ -96,14 +97,18 @@ Signed-in journal pages are cached locally under
 `$XDG_CACHE_HOME/dev-null-tui/` (or `~/.cache/dev-null-tui/` when
 `XDG_CACHE_HOME` is unset). Cache files are private to the account and the
 cache directory/file use owner-only permissions. Each journal keeps at most
-one page of commits; cached pages display immediately at startup while the
-active journal refreshes in the background. Other cached journals refresh when
-opened. The last signed-in profile is cached too, so the profile and journal
+one page of commits in its own account-scoped file; cached pages display
+immediately at startup while the active journal refreshes in the background.
+Other cached journals refresh when opened, and existing combined journal caches
+are split automatically. The first 20 notifications are cached per account and
+displayed immediately when the notifications inbox opens while its refresh
+runs. The last signed-in profile is cached too, so the profile and journal
 cards can render while an existing saved device key is being checked. This
-cached view does not enable signed-in actions until the API confirms the
-device. An explicit authentication rejection clears that account's cached
-profile and journals; missing keys, network errors, and manual logout leave the
-cache intact.
+cached view does not enable signed-in actions until the API confirms the device.
+An explicit
+authentication rejection clears that account's cached profile, journals, and
+notifications; missing keys, network errors, and manual logout leave the cache
+intact.
 
 **Log out** removes the local private and public key files and clears the
 in-memory session; callback handoff data and the callback-handler registration

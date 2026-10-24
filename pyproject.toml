@@ -10,14 +10,14 @@ requires-python = ">=3.11"
 dependencies = [
     "Pillow>=11.0.0",
     "textual>=8.2.8",
-    "textual-image[textual]>=0.6.6,<0.7",
+    "textual-image[textual]>=0.6.6",
 ]
 
 [project.scripts]
 dev-null-tty = "dev_null_tty:main"
 
 [build-system]
-requires = ["uv_build>=0.12.10,<0.13.0"]
+requires = ["uv_build>=0.13.5,<0.14.0"]
 build-backend = "uv_build"
 
 [dependency-groups]

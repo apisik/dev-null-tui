@@ -58,6 +58,7 @@ from dev_null_tty.api import (
     resolve_ssh_identity,
     signed_headers,
 )
+from dev_null_tty.log_cache import NotificationCache
 from dev_null_tty.log_cache import CommitLogCache, StartupProfileCache
 
 
@@ -645,7 +646,7 @@ async def test_missing_saved_key_keeps_cache_hidden_and_preserved(
         assert app.optimistic_cached_user is None
         assert "@guest" in str(app.query_one("#profile-card", Static).render())
         assert StartupProfileCache().load() == cached_user
-        assert cache.path.exists()
+        assert cache.path_for("latest").exists()
 
 
 @pytest.mark.asyncio
@@ -701,7 +702,7 @@ async def test_transient_restore_failure_keeps_optimistic_cache(
         assert [card.commit.id for card in app.query_one("#latest-list").children] == [
             "cached-commit"
         ]
-        assert cache.path.exists()
+        assert cache.path_for("latest").exists()
 
 
 @pytest.mark.asyncio
@@ -1147,6 +1148,8 @@ async def test_notifications_view_loads_pages_and_opens_commit() -> None:
 
     app = DevNullApp()
     client = FakeClient()
+    toasts: list[str] = []
+    app.notify = lambda message, **kwargs: toasts.append(str(message))
 
     async with app.run_test(size=(120, 40)) as pilot:
         app._set_authenticated_user(
@@ -1162,6 +1165,8 @@ async def test_notifications_view_loads_pages_and_opens_commit() -> None:
         notification_list = app.query_one("#notifications-list")
         assert client.cursors == [None, "older"]
         assert len(notification_list.children) == 2
+        assert toasts[0] in {"Loading notifications...", "Refreshing notifications..."}
+        assert "Loading more notifications..." in toasts
         rendered_notification = notification_list.children[0].query_one(LinkedText).content
         assert isinstance(rendered_notification, Text)
         assert "starred your commit" in rendered_notification.plain
@@ -1201,6 +1206,174 @@ async def test_notifications_view_loads_pages_and_opens_commit() -> None:
         await pilot.press("q")
         await pilot.pause()
         assert not isinstance(app.screen, CommitDetailScreen)
+
+
+@pytest.mark.asyncio
+async def test_cached_notifications_render_before_refresh_finishes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    cached_notification = ApiNotification(
+        "cached-notification",
+        "starred",
+        "2026-10-20T18:00:00Z",
+        ApiUser("octocat", "The Octocat", None, None),
+        1,
+        1,
+        1,
+        None,
+        None,
+    )
+    server_notification = ApiNotification(
+        "server-notification",
+        "followed",
+        "2026-10-21T18:00:00Z",
+        ApiUser("octocat", "The Octocat", None, None),
+        1,
+        1,
+        0,
+        None,
+        None,
+    )
+    NotificationCache("octocat").save((cached_notification,), "read-marker")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def get_notifications(self, cursor=None) -> ApiNotifications:
+            assert cursor is None
+            self.started.set()
+            self.release.wait(timeout=2)
+            return ApiNotifications((server_notification,), None, "new-read-marker")
+
+    app = DevNullApp()
+    client = FakeClient()
+    toasts: list[str] = []
+    app.notify = lambda message, **kwargs: toasts.append(str(message))
+
+    async with app.run_test() as pilot:
+        app._set_authenticated_user(
+            client,
+            ApiUser("octocat", "The Octocat", None, None),
+        )
+        app.action_show_notifications()
+        await pilot.pause(0.1)
+
+        notification_list = app.query_one("#notifications-list")
+        assert client.started.is_set()
+        assert [
+            item.notification.id for item in notification_list.children
+        ] == ["cached-notification"]
+        assert toasts == ["Refreshing notifications..."]
+
+        client.release.set()
+        for _ in range(40):
+            if not app.notifications_loading:
+                break
+            await pilot.pause(0.05)
+        assert [
+            item.notification.id for item in notification_list.children
+        ] == ["server-notification"]
+        cached = NotificationCache("octocat").load()
+        assert cached is not None
+        assert [item.id for item in cached.notifications] == ["server-notification"]
+        assert cached.read_at == "new-read-marker"
+
+
+@pytest.mark.asyncio
+async def test_reset_log_loads_are_coalesced_after_fast_success() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_log(self, log_name, cursor=None) -> ApiLog:
+            self.calls += 1
+            return ApiLog((), None, False, 0, ())
+
+    app = DevNullApp()
+    client = FakeClient()
+    app.api_client = client
+    app.log_loaded["latest"] = True
+
+    async with app.run_test() as pilot:
+        app._start_log_load("latest", reset=True)
+        for _ in range(40):
+            if not app.log_loading["latest"]:
+                break
+            await pilot.pause(0.05)
+        assert client.calls == 1
+
+        app._start_log_load("latest", reset=True)
+        await pilot.pause(0.1)
+        assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_notifications_load_missing_quoted_commit_preview() -> None:
+    quote_body = ("Full quote text. " * 20) + "QUOTE_END_SENTINEL"
+    quoted_commit = ApiCommit(
+        "quoted-id",
+        "bob",
+        "Bob",
+        quote_body,
+        "2026-10-20T17:00:00Z",
+        0,
+        0,
+    )
+    notification_commit = ApiCommit(
+        "quote-post",
+        "alice",
+        "Alice",
+        "A quote notification.",
+        "2026-10-20T18:00:00Z",
+        0,
+        0,
+        quoted_commit_id=quoted_commit.id,
+    )
+    notification = ApiNotification(
+        "quote-notification",
+        "quoted",
+        "2026-10-20T18:00:00Z",
+        ApiUser("alice", "Alice", None, None),
+        1,
+        1,
+        1,
+        None,
+        notification_commit,
+    )
+
+    class FakeClient:
+        quoted_requests = []
+
+        def get_notifications(self, cursor=None) -> ApiNotifications:
+            return ApiNotifications((notification,), None, None)
+
+        def get_commit_detail(self, commit_id) -> ApiCommitDetail:
+            self.quoted_requests.append(commit_id)
+            return ApiCommitDetail(quoted_commit, ())
+
+    app = DevNullApp()
+    client = FakeClient()
+    app.api_client = client
+
+    async with app.run_test() as pilot:
+        app.action_show_notifications()
+        for _ in range(30):
+            cards = app.query("#notifications-list NotificationCard")
+            if cards:
+                content = cards[0].query_one(LinkedText).content
+                if isinstance(content, Text) and "QUOTE_END_SENTINEL" in content.plain:
+                    break
+            await pilot.pause(0.05)
+
+        assert len(cards) == 1
+        assert isinstance(content, Text)
+        assert "QUOTED COMMIT" in content.plain
+        assert "QUOTE_END_SENTINEL" in content.plain
+        assert client.quoted_requests == ["quoted-id"]
 
 
 @pytest.mark.asyncio
@@ -3280,6 +3453,7 @@ def test_get_notifications_sends_signed_cursor_and_parses_groups(
                                 "created_at": "2026-10-20T17:00:00Z",
                                 "stars_count": 2,
                                 "replies_count": 0,
+                                "quoted_commit_id": "quoted-id",
                                 "author": {
                                     "username": "reader",
                                     "name": "Reader",
@@ -3332,6 +3506,7 @@ def test_get_notifications_sends_signed_cursor_and_parses_groups(
                 "2026-10-20T17:00:00Z",
                 2,
                 0,
+                quoted_commit_id="quoted-id",
             ),
         ),
     )

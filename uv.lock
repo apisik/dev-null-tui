@@ -1,6 +1,10 @@
 version = 1
 revision = 3
 requires-python = ">=3.11"
+resolution-markers = [
+    "python_full_version >= '3.12'",
+    "python_full_version < '3.12'",
+]
 
 [[package]]
 name = "colorama"
@@ -18,7 +22,8 @@ source = { editable = "." }
 dependencies = [
     { name = "pillow" },
     { name = "textual" },
-    { name = "textual-image", extra = ["textual"] },
+    { name = "textual-image", version = "0.12.0", source = { registry = "https://pypi.org/simple" }, extra = ["textual"], marker = "python_full_version < '3.12'" },
+    { name = "textual-image", version = "0.14.2", source = { registry = "https://pypi.org/simple" }, extra = ["textual"], marker = "python_full_version >= '3.12'" },
 ]
 
 [package.dev-dependencies]
@@ -31,7 +36,7 @@ dev = [
 requires-dist = [
     { name = "pillow", specifier = ">=11.0.0" },
     { name = "textual", specifier = ">=8.2.8" },
-    { name = "textual-image", extras = ["textual"], specifier = ">=0.6.6,<0.7" },
+    { name = "textual-image", extras = ["textual"], specifier = ">=0.6.6" },
 ]
 
 [package.metadata.requires-dev]
@@ -283,15 +288,39 @@ wheels = [
 
 [[package]]
 name = "textual-image"
-version = "0.6.6"
+version = "0.12.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.12'",
+]
 dependencies = [
     { name = "pillow" },
     { name = "rich" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/af/c4/6ae0bcd2cba883a3e54e15746f8c85e0b803adede4fc59d7693107c16197/textual_image-0.6.6.tar.gz", hash = "sha256:df4a64955268f02fb12420952bae30ac0da1d7c6c1bb3d92ade611a4a16f06d9", size = 107700, upload-time = "2024-10-21T20:08:27.204Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c2/e7/c82ea0604874b6d51d5717a0911061ae5810e36dad2e4d2b11fa7d54cdaa/textual_image-0.12.0.tar.gz", hash = "sha256:fdd0b5ff9c8a99740bc360a99ce014d563fa97d07a5b49b472470809f57c0a74", size = 116403, upload-time = "2026-04-12T17:37:44.696Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c8/bd/362db64ce8be6179a5a6010e54769b3441654a2b45ad9cdcfa0832b15a30/textual_image-0.6.6-py3-none-any.whl", hash = "sha256:7683a71c294ac4081d30296182d43ff73bf4d57c0657e7e8cf1aa93911909f6f", size = 108425, upload-time = "2024-10-21T20:08:25.311Z" },
+    { url = "https://files.pythonhosted.org/packages/67/2c/38ac586a3834a3bd8cbcf0c8ea1ae23bf68b9cc13b96a67f47a825479dd3/textual_image-0.12.0-py3-none-any.whl", hash = "sha256:0b13f62fe6a29f4ed6dfd641f2779ffe92dde41f16163fa1de69158477aa50aa", size = 115626, upload-time = "2026-04-12T17:37:41.238Z" },
+]
+
+[package.optional-dependencies]
+textual = [
+    { name = "textual" },
+]
+
+[[package]]
+name = "textual-image"
+version = "0.14.2"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.12'",
+]
+dependencies = [
+    { name = "pillow" },
+    { name = "rich" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e8/32/7844d7c06cfc540caeb3ad8e7f96e66a12daac8934f4d45a86cab879e7e1/textual_image-0.14.2.tar.gz", hash = "sha256:0ec2ac1e2a9b30bfc478708ea011eb31e7844c377322ed2094976c1a84c131ba", size = 181319, upload-time = "2026-10-20T20:15:50.992Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/66/da/80883aab94e35ff27b3fc6f28eeb1824c19422090344b15d54d24e9dd02f/textual_image-0.14.2-py3-none-any.whl", hash = "sha256:f698d883959637515ab6c7086ffbc17fffc204a90010562b4f3bd1fba963ade4", size = 183633, upload-time = "2026-10-20T20:15:49.47Z" },
 ]
 
 [package.optional-dependencies]

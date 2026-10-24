@@ -68,7 +68,13 @@ from .api import (
     saved_device_identity_files_exist,
 )
 from .desktop import callback_handoff_path, register_uri_handler
-from .log_cache import CachedLog, CommitLogCache, StartupProfileCache
+from .log_cache import (
+    CachedLog,
+    CachedNotifications,
+    CommitLogCache,
+    NotificationCache,
+    StartupProfileCache,
+)
 from textual_image._terminal import get_cell_size
 from textual_image.widget import Image as TerminalImage
 
@@ -76,6 +82,7 @@ ComposerMode = Literal["new", "reply", "quote"]
 _URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 _IMAGE_PREVIEW_ID = secrets.randbelow(0xFFFFFF) + 1
 _LOG_KEY_DOUBLE_PRESS_SECONDS = 0.65
+_LOG_REFRESH_COALESCE_SECONDS = 1.0
 _OMARCHY_THEME_COLOR_FIELDS = (
     "accent",
     "selection",
@@ -1023,6 +1030,19 @@ class NotificationCard(ListItem):
 
     def update_commit(self, commit: ApiCommit) -> None:
         self.notification = replace(self.notification, commit=commit)
+        self._update_display()
+
+    def update_quoted_commit(self, quoted_commit: ApiCommitPreview) -> None:
+        commit = self.notification.commit
+        if commit is None:
+            return
+        self.notification = replace(
+            self.notification,
+            commit=replace(commit, quoted_commit=quoted_commit),
+        )
+        self._update_display()
+
+    def _update_display(self) -> None:
         text = self.query_one(LinkedText)
         text.update(
             _notification_display(
@@ -1786,8 +1806,7 @@ class CommitDetailScreen(ModalScreen[None]):
         preview = level.commit.quoted_commit
         if (
             level.commit.quoted_commit_id is None
-            or preview is None
-            or preview.deleted
+            or (preview is not None and preview.deleted)
             or level.quoted_commit_detail is not None
             or level.quoted_commit_loading
             or level.quoted_commit_failed
@@ -2338,6 +2357,7 @@ def _commit_display(
             full_quoted_commit or commit.quoted_commit,
             "Original commit is unavailable.",
             width=max(1, width or 72),
+            truncate_preview=False,
         )
     if show_counts:
         rendered.append(
@@ -2393,7 +2413,7 @@ def _append_commit_preview(
             if preview.username is not None:
                 author_line.append(f" @{preview.username}", style="dim")
             _append_quoted_line(rendered, author_line, width)
-        if isinstance(preview, ApiCommitPreview) and preview.deleted:
+        if preview.deleted:
             body = "This commit was deleted."
         elif preview.body is None or not preview.body.strip():
             body = "Commit text is unavailable."
@@ -2483,6 +2503,7 @@ def _notification_display(
                 notification.commit.quoted_commit,
                 "Original commit is unavailable.",
                 width=max(1, width or 72),
+                truncate_preview=False,
             )
     if notification.reason:
         reason = notification.reason.strip()
@@ -2598,11 +2619,23 @@ class DevNullApp(App[None]):
             "latest": False,
             "trending": False,
         }
+        self._log_reset_started_at: dict[LogName, float | None] = {
+            "following": None,
+            "latest": None,
+            "trending": None,
+        }
         self.startup_cached_logs: dict[LogName, tuple[ApiCommit, ...]] = {}
         self._startup_cache_warning: str | None = None
+        self.notification_cache: NotificationCache | None = None
+        self.cached_notifications: CachedNotifications | None = None
         self.notification_cursor: str | None = None
+        self.notification_read_at: str | None = None
         self.notifications_version = 0
         self.notifications_loading = False
+        self.notification_quote_previews: dict[str, ApiCommitPreview] = {}
+        self.notification_quote_loading: set[str] = set()
+        self.notification_quote_failures: set[str] = set()
+        self.notification_quote_generation = 0
         self._preload_startup_cache()
 
     def _preload_startup_cache(self) -> None:
@@ -2623,17 +2656,34 @@ class DevNullApp(App[None]):
 
         self.optimistic_cached_user = cached_user
         self.log_cache = CommitLogCache(cached_user.username)
+        self.notification_cache = NotificationCache(cached_user.username)
         try:
-            entries = self.log_cache.load()
+            self.cached_notifications = self.notification_cache.load()
         except (OSError, ValueError) as error:
-            self._startup_cache_warning = f"Could not read the local journal cache: {error}"
-            return
-
-        self.log_cache_entries = entries
-        for log_name, entry in entries.items():
+            self._startup_cache_warning = (
+                f"Could not read the local notifications cache: {error}"
+            )
+        entries: dict[LogName, CachedLog] = {}
+        cache_warnings: list[str] = []
+        if self._startup_cache_warning is not None:
+            cache_warnings.append(self._startup_cache_warning)
+        for log_name in ("following", "latest", "trending"):
+            try:
+                entry = self.log_cache.load_log(log_name)
+            except (OSError, ValueError) as error:
+                cache_warnings.append(
+                    f"Could not read the local {log_name} journal cache: {error}"
+                )
+                continue
+            if entry is None:
+                continue
+            entries[log_name] = entry
             self.log_page_sizes[log_name] = max(LOG_PAGE_SIZE, entry.page_size)
             self.log_loaded[log_name] = bool(entry.commits)
             self.startup_cached_logs[log_name] = entry.commits
+        self.log_cache_entries = entries
+        if cache_warnings:
+            self._startup_cache_warning = "; ".join(cache_warnings)
 
     def on_mount(self) -> None:
         self._show_view("latest-view", "LOG / LATEST", "latest-log")
@@ -2810,6 +2860,8 @@ class DevNullApp(App[None]):
 
     def action_show_notifications(self) -> None:
         self._show_view("notifications-view", "NOTIFICATIONS", "notifications")
+        if not self.query_one("#notifications-list", NotificationsListView).children:
+            self._restore_cached_notifications()
         self._start_notifications_load(reset=True)
 
     def action_next_commit(self) -> None:
@@ -3333,16 +3385,34 @@ class DevNullApp(App[None]):
 
     def _set_authenticated_user(self, client: SignedApiClient, user: ApiUser) -> None:
         cached_user = self.optimistic_cached_user
-        keep_cached_logs = (
+        same_cached_account = (
             cached_user is not None
             and cached_user.username.casefold() == user.username.casefold()
         )
+        if (
+            self.authenticated_user is not None
+            and self.authenticated_user.username.casefold() != user.username.casefold()
+        ):
+            self._clear_notification_quote_cache()
         self.api_client = client
         self.authenticated_user = user
         self.optimistic_cached_user = None
         self.log_cache = CommitLogCache(user.username)
-        if not keep_cached_logs:
+        self.notification_cache = NotificationCache(user.username)
+        if not same_cached_account:
             self.log_cache_entries = {}
+            for log_name in self._log_reset_started_at:
+                self._log_reset_started_at[log_name] = None
+            self.cached_notifications = None
+            self.query_one("#notifications-list", NotificationsListView).clear()
+            self.notification_cursor = None
+            self.notification_read_at = None
+            try:
+                self.cached_notifications = self.notification_cache.load()
+            except (OSError, ValueError) as error:
+                self._notify_log_cache_error(
+                    f"Could not read the local notifications cache: {error}"
+                )
         self._log_cache_error = None
         self.query_one("#profile-card", Static).update(
             f"[bold]@{escape(user.username)}[/bold]\n[dim]{escape(user.name or user.username)}[/dim]\n\n"
@@ -3369,8 +3439,16 @@ class DevNullApp(App[None]):
     async def _clear_optimistic_cached_display(self) -> None:
         self.optimistic_cached_user = None
         self.log_cache = None
+        self.notification_cache = None
+        self.cached_notifications = None
         self.log_cache_entries = {}
         self.startup_cached_logs.clear()
+        self.query_one("#notifications-list", NotificationsListView).clear()
+        self.notification_cursor = None
+        self.notification_read_at = None
+        self.notifications_version += 1
+        self.notifications_loading = False
+        self._clear_notification_quote_cache()
         for log_name in ("following", "latest", "trending"):
             await self.query_one(f"#{log_name}-list", JournalListView).clear()
             self.log_cursors[log_name] = None
@@ -3385,6 +3463,7 @@ class DevNullApp(App[None]):
             self.pending_log_refresh_replaces_log[log_name] = False
             self.log_versions[log_name] += 1
             self.log_loading[log_name] = False
+            self._log_reset_started_at[log_name] = None
         self.query_one("#profile-card", Static).update(
             "[bold]@guest[/bold]\n[dim]Public visitor[/dim]\n\n"
             "You are reading /dev/null as a guest.\n"
@@ -3405,17 +3484,28 @@ class DevNullApp(App[None]):
         cache = self.log_cache
         if cache is None:
             return
-        try:
-            entries = await asyncio.to_thread(cache.load)
-        except (OSError, ValueError) as error:
-            self._notify_log_cache_error(f"Could not read the local journal cache: {error}")
-            entries = {}
-        self.log_cache_entries = entries
-        for log_name, entry in entries.items():
-            self.log_page_sizes[log_name] = max(LOG_PAGE_SIZE, entry.page_size)
-            self.log_loaded[log_name] = bool(entry.commits)
+        log_names: tuple[LogName, ...] = ("following", "latest", "trending")
+        results = await asyncio.gather(
+            *(asyncio.to_thread(cache.load_log, log_name) for log_name in log_names),
+            return_exceptions=True,
+        )
+        entries: dict[LogName, CachedLog] = {}
+        for log_name, result in zip(log_names, results, strict=True):
+            if isinstance(result, BaseException):
+                if isinstance(result, (OSError, ValueError)):
+                    self._notify_log_cache_error(
+                        f"Could not read the local {log_name} journal cache: {result}"
+                    )
+                    continue
+                raise result
+            if result is None:
+                continue
+            entries[log_name] = result
+            self.log_page_sizes[log_name] = max(LOG_PAGE_SIZE, result.page_size)
+            self.log_loaded[log_name] = bool(result.commits)
             commit_list = self.query_one(f"#{log_name}-list", JournalListView)
-            await commit_list.extend(CommitCard(commit) for commit in entry.commits)
+            await commit_list.extend(CommitCard(commit) for commit in result.commits)
+        self.log_cache_entries = entries
 
     def _save_log_cache(
         self,
@@ -3453,11 +3543,14 @@ class DevNullApp(App[None]):
         except OSError as error:
             status.update(f"[bold red]Could not log out: {escape(str(error))}[/bold red]")
         else:
+            self._clear_notification_quote_cache()
             self.authenticated_user = None
             self.optimistic_cached_user = None
             self.api_client = None
             self.pending_authorization = None
             self.startup_cached_logs.clear()
+            self.notification_cache = None
+            self.cached_notifications = None
             self.query_one("#profile-card", Static).update(
                 "[bold]@guest[/bold]\n[dim]Public visitor[/dim]\n\n"
                 "You are reading /dev/null as a guest.\n"
@@ -3472,6 +3565,7 @@ class DevNullApp(App[None]):
             notifications_status.update("Sign in to load your notifications.")
             notifications_status.display = False
             self.notification_cursor = None
+            self.notification_read_at = None
             self.notifications_version += 1
             self.notifications_loading = False
             for log_name in ("following", "latest", "trending"):
@@ -3492,6 +3586,7 @@ class DevNullApp(App[None]):
                 self.pending_log_refresh_replaces_log[log_name] = False
                 self.log_versions[log_name] += 1
                 self.log_loading[log_name] = False
+                self._log_reset_started_at[log_name] = None
             self.log_cache = None
             self.log_cache_entries = {}
             self._show_view("profile", "PROFILE / GUEST", "profile")
@@ -3678,6 +3773,14 @@ class DevNullApp(App[None]):
             return
         if self.log_loading[log_name]:
             return
+        now = time.monotonic()
+        last_reset = self._log_reset_started_at[log_name]
+        if (
+            reset
+            and last_reset is not None
+            and now - last_reset < _LOG_REFRESH_COALESCE_SECONDS
+        ):
+            return
         if not reset and self.log_cursors[log_name] is None:
             return
         if notify_refresh_start and self.log_loaded[log_name]:
@@ -3688,6 +3791,8 @@ class DevNullApp(App[None]):
         self.log_versions[log_name] += 1
         version = self.log_versions[log_name]
         self.log_loading[log_name] = True
+        if reset and self.log_loaded[log_name]:
+            self._log_reset_started_at[log_name] = now
         self.run_worker(
             self._load_log_page(log_name, cursor, reset, version),
             group=f"log-{log_name}",
@@ -3710,10 +3815,12 @@ class DevNullApp(App[None]):
             log = await asyncio.to_thread(client.get_log, log_name, cursor)
         except ApiError as error:
             if version == self.log_versions[log_name] and self.is_running:
+                self._log_reset_started_at[log_name] = None
                 status.display = True
                 status.update(f"[bold red]Could not load journal: {escape(str(error))}[/bold red]")
         except OSError as error:
             if version == self.log_versions[log_name] and self.is_running:
+                self._log_reset_started_at[log_name] = None
                 status.display = True
                 status.update(f"[bold red]Could not load journal: {escape(str(error))}[/bold red]")
         else:
@@ -3821,12 +3928,20 @@ class DevNullApp(App[None]):
             return
         if reset:
             self.notification_cursor = None
-            notification_list.clear()
+            self.notification_quote_failures.clear()
+        if reset:
+            self.notify(
+                "Refreshing notifications..."
+                if notification_list.children
+                else "Loading notifications...",
+                title="Notifications",
+            )
+        else:
+            self.notify("Loading more notifications...", title="Notifications")
         self.notifications_version += 1
         version = self.notifications_version
         self.notifications_loading = True
-        status.display = True
-        status.update("[dim]Loading notifications...[/dim]")
+        status.display = False
         self.run_worker(
             self._load_notifications_page(
                 self.notification_cursor,
@@ -3860,10 +3975,25 @@ class DevNullApp(App[None]):
             if version != self.notifications_version or not self.is_running:
                 return
             if reset:
-                notification_list.clear()
-            cards = [NotificationCard(item) for item in page.notifications]
-            notification_list.extend(cards)
+                await notification_list.clear()
+            existing_ids = {
+                item.notification.id
+                for item in notification_list.children
+                if isinstance(item, NotificationCard)
+            }
+            cards: list[NotificationCard] = []
+            for notification in page.notifications:
+                if notification.id in existing_ids:
+                    continue
+                existing_ids.add(notification.id)
+                cards.append(NotificationCard(notification))
+            await notification_list.extend(cards)
+            for card in cards:
+                self._load_notification_quote_if_missing(card)
             self.notification_cursor = page.next_cursor
+            self.notification_read_at = page.read_at
+            if reset:
+                await self._save_notification_cache(page.notifications)
             if not notification_list.children and page.next_cursor is None:
                 status.display = True
                 status.update("No notifications yet.")
@@ -3874,6 +4004,145 @@ class DevNullApp(App[None]):
         finally:
             if version == self.notifications_version:
                 self.notifications_loading = False
+
+    def _load_notification_quote_if_missing(self, card: NotificationCard) -> None:
+        notification_commit = card.notification.commit
+        if notification_commit is None or notification_commit.quoted_commit is not None:
+            return
+        quoted_commit_id = notification_commit.quoted_commit_id
+        if quoted_commit_id is None:
+            return
+        cached_preview = self.notification_quote_previews.get(quoted_commit_id)
+        if cached_preview is not None:
+            card.update_quoted_commit(cached_preview)
+            return
+        if (
+            self.api_client is None
+            or quoted_commit_id in self.notification_quote_loading
+            or quoted_commit_id in self.notification_quote_failures
+        ):
+            return
+        client = self.api_client
+        generation = self.notification_quote_generation
+        self.notification_quote_loading.add(quoted_commit_id)
+        self.run_worker(
+            self._fetch_notification_quote(client, quoted_commit_id, generation),
+            group=f"notification-quote-{quoted_commit_id}",
+            exclusive=True,
+        )
+
+    async def _fetch_notification_quote(
+        self,
+        client: SignedApiClient,
+        quoted_commit_id: str,
+        generation: int,
+    ) -> None:
+        try:
+            detail = await asyncio.to_thread(
+                client.get_commit_detail,
+                quoted_commit_id,
+            )
+        except (ApiError, OSError) as error:
+            if generation == self.notification_quote_generation:
+                self.notification_quote_failures.add(quoted_commit_id)
+                if (
+                    self.is_running
+                    and client is self.api_client
+                    and not (
+                        isinstance(error, ApiError)
+                        and error.http_status in {403, 404}
+                    )
+                ):
+                    self.notify(
+                        f"Could not load a quoted commit: {error}",
+                        severity="warning",
+                    )
+        else:
+            if (
+                generation != self.notification_quote_generation
+                or client is not self.api_client
+                or not self.is_running
+            ):
+                return
+            commit = detail.commit
+            preview = ApiCommitPreview(
+                id=commit.id,
+                username=commit.username or None,
+                author_name=commit.author_name,
+                body=commit.body or None,
+                deleted=commit.deleted,
+            )
+            self.notification_quote_previews[quoted_commit_id] = preview
+            for item in self.query_one(
+                "#notifications-list", NotificationsListView
+            ).children:
+                if (
+                    isinstance(item, NotificationCard)
+                    and item.notification.commit is not None
+                    and item.notification.commit.quoted_commit_id == quoted_commit_id
+                ):
+                    item.update_quoted_commit(preview)
+            await self._save_notification_cache(
+                tuple(
+                    item.notification
+                    for item in self.query_one(
+                        "#notifications-list", NotificationsListView
+                    ).children
+                    if isinstance(item, NotificationCard)
+                )
+            )
+        finally:
+            if generation == self.notification_quote_generation:
+                self.notification_quote_loading.discard(quoted_commit_id)
+
+    def _clear_notification_quote_cache(self) -> None:
+        self.notification_quote_generation += 1
+        self.notification_quote_previews.clear()
+        self.notification_quote_loading.clear()
+        self.notification_quote_failures.clear()
+
+    def _restore_cached_notifications(self) -> None:
+        cached = self.cached_notifications
+        if cached is None:
+            return
+        notification_list = self.query_one(
+            "#notifications-list", NotificationsListView
+        )
+        if notification_list.children:
+            return
+        notification_list.extend(
+            NotificationCard(notification) for notification in cached.notifications
+        )
+        self.notification_read_at = cached.read_at
+        for card in notification_list.children:
+            if isinstance(card, NotificationCard):
+                self._load_notification_quote_if_missing(card)
+
+    async def _save_notification_cache(
+        self,
+        notifications: tuple[ApiNotification, ...],
+    ) -> None:
+        cache = self.notification_cache
+        if cache is None:
+            return
+        try:
+            await asyncio.to_thread(
+                cache.save,
+                notifications,
+                self.notification_read_at,
+                self.notification_quote_previews,
+            )
+        except OSError as error:
+            self._notify_log_cache_error(
+                f"Could not save the local notifications cache: {error}"
+            )
+            return
+        try:
+            self.cached_notifications = await asyncio.to_thread(cache.load)
+        except (OSError, ValueError) as error:
+            self._notify_log_cache_error(
+                f"Could not read the local notifications cache: {error}"
+            )
 
     def _on_notifications_scroll_end(self) -> None:
         if self.query_one("#views", ContentSwitcher).current != "notifications-view":
